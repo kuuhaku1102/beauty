@@ -1,6 +1,24 @@
-import os, re, json, base64, time
+# scripts/scrape.py
+# 推奨セット（clinics / menus / hours）対応版
+# 環境変数:
+#   TARGET_URLS              (例: "https://kireireport.com/clinics/1929")
+#   OUTPUT_DIR               (例: "output")
+#   GSHEET_JSON_B64          (必須: サービスアカウントJSONのbase64)
+#   GSHEET_KEY               (必須: スプレッドシートID)
+#   GSHEET_WS_CLINICS        (既定 "clinics")
+#   GSHEET_WS_MENUS          (既定 "menus")
+#   GSHEET_WS_HOURS          (既定 "hours")
+#
+# アーティファクト:
+#   output/clinics.csv, output/menus.csv, output/hours.csv, output/cards.json
+
+import os
+import re
+import json
+import base64
+import time
 from datetime import datetime, timezone
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
 import pandas as pd
@@ -8,17 +26,36 @@ import pandas as pd
 USER_AGENT = "Mozilla/5.0 (compatible; ScraperBot/1.0; +https://github.com/your/repo)"
 TIMEOUT = 30
 RETRY = 3
-SLEEP_BETWEEN = 2
+SLEEP_BETWEEN = 2  # sec
 
+# ---------- utils ----------
 def now_utc_iso():
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
-def clean_text(s): return re.sub(r"\s+", " ", s).strip() if s else ""
+def clean(s):
+    return re.sub(r"\s+", " ", s).strip() if s else ""
+
 def to_int(s):
     if not s: return None
     m = re.search(r"\d+", s.replace(",", ""))
     return int(m.group()) if m else None
 
+def get_clinic_id_from_url(u: str):
+    try:
+        path = urlparse(u).path
+        m = re.search(r"/clinics/(\d+)", path)
+        return m.group(1) if m else ""
+    except Exception:
+        return ""
+
+def split_hours(raw: str):
+    """ '10:00 ~ 19:00' → ('10:00','19:00') / 失敗時は (None,None) """
+    if not raw: return (None, None)
+    m = re.search(r"(\d{1,2}:\d{2})\s*[~〜-]\s*(\d{1,2}:\d{2})", raw)
+    if m: return (m.group(1), m.group(2))
+    return (None, None)
+
+# ---------- fetch ----------
 def fetch(url):
     last_exc = None
     for i in range(RETRY):
@@ -31,23 +68,33 @@ def fetch(url):
             time.sleep(SLEEP_BETWEEN * (i + 1))
     raise last_exc
 
-def parse_hours(table):
+# ---------- parse ----------
+def parse_hours_table(table):
     hours = {}
     if not table: return hours
     for tr in table.select("tbody > tr"):
         tds = tr.find_all("td")
-        if len(tds) < 2: continue
-        day = clean_text(tds[0].get_text())
-        time_text = clean_text(tds[1].get_text(" "))
-        if day: hours[day] = time_text
+        if len(tds) < 2: 
+            continue
+        day = clean(tds[0].get_text())
+        time_text = clean(tds[1].get_text(" "))
+        if day:
+            hours[day] = time_text
     return hours
 
 def parse_card(card, base_url=None):
+    # rank
     rank_el = card.select_one(".number_ranked")
     rank = to_int(rank_el.get_text()) if rank_el else None
+
+    # name & url
     a_title = card.select_one("a.card__title")
-    name = clean_text(a_title.get_text() if a_title else "")
-    clinic_url = urljoin(base_url, a_title["href"]) if (base_url and a_title and a_title.has_attr("href")) else (a_title["href"] if a_title and a_title.has_attr("href") else "")
+    name = clean(a_title.get_text() if a_title else "")
+    clinic_url = ""
+    if a_title and a_title.has_attr("href"):
+        clinic_url = urljoin(base_url, a_title["href"]) if base_url else a_title["href"]
+
+    # rating / reviews
     rating = None
     rating_el = card.select_one(".rating-number")
     if rating_el:
@@ -55,15 +102,21 @@ def parse_card(card, base_url=None):
         except: pass
     reviews_el = card.select_one("a.report-count")
     reviews = to_int(reviews_el.get_text()) if reviews_el else None
-    snippet = clean_text(card.select_one(".card__report-snippet-content") and card.select_one(".card__report-snippet-content").get_text())
-    snippet_author = clean_text(card.select_one(".card__report-snippet-name") and card.select_one(".card__report-snippet-name").get_text()).lstrip("-").strip()
+
+    # snippet
+    snippet = clean(card.select_one(".card__report-snippet-content") and card.select_one(".card__report-snippet-content").get_text())
+    snippet_author = clean(card.select_one(".card__report-snippet-name") and card.select_one(".card__report-snippet-name").get_text()).lstrip("-").strip()
+
+    # images, features, access
     images = [img.get("src") for img in card.select(".card__image-list img.card__image[src]")]
-    features = [clean_text(li.get_text()) for li in card.select(".card__feature-list .card__feature")]
-    access_text = clean_text(card.select_one(".card__access-text") and card.select_one(".card__access-text").get_text())
+    features = [clean(li.get_text()) for li in card.select(".card__feature-list .card__feature")]
+    access_text = clean(card.select_one(".card__access-text") and card.select_one(".card__access-text").get_text())
+
+    # menus
     menus = []
     for li in card.select("ul li a.small-list__item"):
-        title = clean_text(li.select_one(".small-list__title") and li.select_one(".small-list__title").get_text())
-        price_text = clean_text(li.select_one(".small-list__price") and li.select_one(".small-list__price").get_text())
+        title = clean(li.select_one(".small-list__title") and li.select_one(".small-list__title").get_text())
+        price_text = clean(li.select_one(".small-list__price") and li.select_one(".small-list__price").get_text())
         price_jpy = None
         m = re.search(r"¥\s*([\d,]+)", price_text or "")
         if m:
@@ -71,27 +124,55 @@ def parse_card(card, base_url=None):
             except: pass
         href = li.get("href") or ""
         menu_url = urljoin(base_url, href) if base_url else href
-        pickup = bool(li.select_one(".pickup-label_active"))
-        cat = clean_text(li.select_one(".treatment-category") and li.select_one(".treatment-category").get_text())
-        menus.append({"title": title, "price_jpy": price_jpy, "price_raw": price_text, "url": menu_url, "pickup_flag": pickup, "category_raw": cat})
-    hours = parse_hours(card.select_one("table.table"))
-    return {"rank": rank, "name": name, "clinic_url": clinic_url, "rating": rating, "reviews": reviews, "snippet": snippet, "snippet_author": snippet_author, "images": images, "features": features, "access": access_text, "hours": hours, "menus": menus}
+        pickup_flag = bool(li.select_one(".pickup-label_active"))
+        category_raw = clean(li.select_one(".treatment-category") and li.select_one(".treatment-category").get_text())
+        menus.append({
+            "menu_title": title,
+            "price_jpy": price_jpy,
+            "price_raw": price_text,
+            "menu_url": menu_url,
+            "pickup_flag": pickup_flag,
+            "category_raw": category_raw,
+        })
+
+    # hours table
+    hours_dict = parse_hours_table(card.select_one("table.table"))
+
+    return {
+        "rank": rank,
+        "name": name,
+        "clinic_url": clinic_url,
+        "rating": rating,
+        "reviews": reviews,
+        "snippet": snippet,
+        "snippet_author": snippet_author,
+        "images": images,
+        "features": features,
+        "access": access_text,
+        "hours": hours_dict,
+        "menus": menus,
+    }
 
 def parse_page(html, page_url):
     soup = BeautifulSoup(html, "html.parser")
     cards = [parse_card(c, base_url=page_url) for c in soup.select(".card.clinic-list__card")]
+    # fallback for single page
     if not cards:
-        title = clean_text(soup.title.string if soup.title else "")
-        h1 = clean_text(soup.select_one("h1") and soup.select_one("h1").get_text())
-        cards.append({"rank": None, "name": h1 or title, "clinic_url": page_url, "rating": None, "reviews": None, "snippet": "", "snippet_author": "", "images": [], "features": [], "access": "", "hours": {}, "menus": []})
+        title = clean(soup.title.string if soup.title else "")
+        h1 = clean(soup.select_one("h1") and soup.select_one("h1").get_text())
+        cards.append({
+            "rank": None, "name": h1 or title, "clinic_url": page_url,
+            "rating": None, "reviews": None, "snippet": "", "snippet_author": "",
+            "images": [], "features": [], "access": "", "hours": {}, "menus": [],
+        })
     return cards
 
-# ===== Google Sheets helpers =====
+# ---------- Sheets ----------
 def get_gspread_client_from_b64(json_b64: str):
     import gspread
     from google.oauth2.service_account import Credentials
     info = json.loads(base64.b64decode(json_b64).decode("utf-8"))
-    scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive.readonly"]
+    scopes = ["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive.readonly"]
     creds = Credentials.from_service_account_info(info, scopes=scopes)
     return gspread.authorize(creds)
 
@@ -102,95 +183,136 @@ def ensure_header(ws, header):
         ws.insert_row(header, 1)
 
 def append_rows(ws, rows):
+    if not rows: return
     header = ws.row_values(1)
     values = [[r.get(k, "") for k in header] for r in rows]
-    if values: ws.append_rows(values, value_input_option="RAW")
+    ws.append_rows(values, value_input_option="RAW")
 
-def write_to_sheet(rows):
+def write_to_sheets_multi(clinics_rows, menus_rows, hours_rows):
     json_b64 = os.getenv("GSHEET_JSON_B64")
     sheet_key = os.getenv("GSHEET_KEY")
-    worksheet_name = os.getenv("GSHEET_WORKSHEET", "scrape")
+    ws_clinics = os.getenv("GSHEET_WS_CLINICS", "clinics")
+    ws_menus   = os.getenv("GSHEET_WS_MENUS", "menus")
+    ws_hours   = os.getenv("GSHEET_WS_HOURS", "hours")
     if not (json_b64 and sheet_key):
         print("[Sheets] Skipped (env not set)."); return
+
     gc = get_gspread_client_from_b64(json_b64)
     sh = gc.open_by_key(sheet_key)
-    try: ws = sh.worksheet(worksheet_name)
-    except Exception: ws = sh.add_worksheet(title=worksheet_name, rows=2000, cols=20)
-    header = ["timestamp_utc","source","url","title","h1","status","notes"]
-    ensure_header(ws, header); append_rows(ws, rows)
-    print(f"[Sheets] Appended {len(rows)} rows to '{worksheet_name}'.")
 
-def write_settings_sheet():
-    """
-    settings シートに機微情報を漏らさず記録：
-      - TARGET_URLS, GSHEET_KEY, GSHEET_WORKSHEET
-      - GSHEET_JSON_B64 は『長さ＆マスク』のみ
-    """
-    if os.getenv("WRITE_SETTINGS_SHEET", "").lower() != "true":
-        return
-    json_b64 = os.getenv("GSHEET_JSON_B64")
-    sheet_key = os.getenv("GSHEET_KEY")
-    worksheet_name = os.getenv("GSHEET_WORKSHEET", "scrape")
-    settings_sheet_name = os.getenv("SETTINGS_SHEET_NAME", "settings")
-    if not (json_b64 and sheet_key):
-        print("[Settings] Skipped (env not set)."); return
-    gc = get_gspread_client_from_b64(json_b64)
-    sh = gc.open_by_key(sheet_key)
-    try: ws = sh.worksheet(settings_sheet_name)
-    except Exception: ws = sh.add_worksheet(title=settings_sheet_name, rows=100, cols=4)
-
-    header = ["key","value","note","updated_utc"]
-    ensure_header(ws, header)
-
-    def masked_summary(b64: str):
-        s = b64.strip()
-        if len(s) <= 12: return f"(masked) len={len(s)}"
-        return f"(masked) len={len(s)}, head={s[:6]}..., tail=...{s[-6:]}"
-    values = [
-        {"key":"TARGET_URLS",       "value": os.getenv("TARGET_URLS",""),  "note":"スクレイピング対象URL(カンマ区切り)", "updated_utc": now_utc_iso()},
-        {"key":"GSHEET_KEY",        "value": sheet_key,                     "note":"スプレッドシートID",                 "updated_utc": now_utc_iso()},
-        {"key":"GSHEET_WORKSHEET",  "value": worksheet_name,                "note":"結果出力シート名",                   "updated_utc": now_utc_iso()},
-        {"key":"GSHEET_JSON_B64",   "value": masked_summary(os.getenv("GSHEET_JSON_B64","")), "note":"Secretsに格納。値は保存しない。", "updated_utc": now_utc_iso()},
+    # clinics
+    clinics_header = [
+        "timestamp_utc","clinic_id","name","rank","rating","reviews_count",
+        "clinic_url","source_page_url","access_text","snippet","snippet_author",
+        "images_csv","features_csv","hours_json","last_seen_utc","status","notes"
     ]
-    append_rows(ws, values)
-    print(f"[Settings] Wrote {len(values)} rows to '{settings_sheet_name}'.")
+    try: ws_c = sh.worksheet(ws_clinics)
+    except Exception: ws_c = sh.add_worksheet(title=ws_clinics, rows=2000, cols=len(clinics_header))
+    ensure_header(ws_c, clinics_header)
+    append_rows(ws_c, clinics_rows)
+    print(f"[Sheets] clinics: +{len(clinics_rows)}")
 
+    # menus
+    menus_header = [
+        "timestamp_utc","clinic_id","menu_title","price_jpy","price_raw",
+        "menu_url","pickup_flag","category_raw"
+    ]
+    try: ws_m = sh.worksheet(ws_menus)
+    except Exception: ws_m = sh.add_worksheet(title=ws_menus, rows=4000, cols=len(menus_header))
+    ensure_header(ws_m, menus_header)
+    append_rows(ws_m, menus_rows)
+    print(f"[Sheets] menus: +{len(menus_rows)}")
+
+    # hours
+    hours_header = ["timestamp_utc","clinic_id","day","open_time","close_time","raw"]
+    try: ws_h = sh.worksheet(ws_hours)
+    except Exception: ws_h = sh.add_worksheet(title=ws_hours, rows=2000, cols=len(hours_header))
+    ensure_header(ws_h, hours_header)
+    append_rows(ws_h, hours_rows)
+    print(f"[Sheets] hours: +{len(hours_rows)}")
+
+# ---------- main ----------
 def main():
     target_urls = os.getenv("TARGET_URLS", "").strip()
-    if not target_urls: raise SystemExit("TARGET_URLS is empty")
+    if not target_urls:
+        raise SystemExit("TARGET_URLS is empty")
     urls = [u.strip() for u in target_urls.split(",") if u.strip()]
-    out_dir = os.getenv("OUTPUT_DIR", "output"); os.makedirs(out_dir, exist_ok=True)
 
-    all_rows, all_cards = [], []
+    out_dir = os.getenv("OUTPUT_DIR", "output")
+    os.makedirs(out_dir, exist_ok=True)
+
     ts = now_utc_iso()
+    clinics_rows, menus_rows, hours_rows = [], [], []
+    all_cards = []
 
-    for url in urls:
-        print(f"[Fetch] {url}")
-        html = fetch(url)
-        cards = parse_page(html, url)
+    for page_url in urls:
+        print(f"[Fetch] {page_url}")
+        html = fetch(page_url)
+        cards = parse_page(html, page_url)
         all_cards.extend(cards)
+
         for c in cards:
-            notes = []
-            if c.get("rating") is not None: notes.append(f"rating={c['rating']}")
-            if c.get("reviews") is not None: notes.append(f"reviews={c['reviews']}")
-            all_rows.append({
-                "timestamp_utc": ts, "source": "requests",
-                "url": c.get("clinic_url", url),
-                "title": c.get("name",""),
-                "h1": c.get("name",""),
-                "status": "ok", "notes": ", ".join(notes)
+            clinic_url = c.get("clinic_url") or page_url
+            clinic_id = get_clinic_id_from_url(clinic_url)
+            images_csv = ",".join(c.get("images", []))
+            features_csv = ",".join(c.get("features", []))
+            hours_json = json.dumps(c.get("hours", {}), ensure_ascii=False)
+
+            clinics_rows.append({
+                "timestamp_utc": ts,
+                "clinic_id": clinic_id,
+                "name": c.get("name",""),
+                "rank": c.get("rank"),
+                "rating": c.get("rating"),
+                "reviews_count": c.get("reviews"),
+                "clinic_url": clinic_url,
+                "source_page_url": page_url,
+                "access_text": c.get("access",""),
+                "snippet": c.get("snippet",""),
+                "snippet_author": c.get("snippet_author",""),
+                "images_csv": images_csv,
+                "features_csv": features_csv,
+                "hours_json": hours_json,
+                "last_seen_utc": ts,
+                "status": "ok",
+                "notes": "",
             })
 
-    # 保存
-    pd.DataFrame(all_rows).to_csv(os.path.join(out_dir, "latest.csv"), index=False, encoding="utf-8-sig")
+            # menus
+            for m in c.get("menus", []):
+                menus_rows.append({
+                    "timestamp_utc": ts,
+                    "clinic_id": clinic_id,
+                    "menu_title": m.get("menu_title",""),
+                    "price_jpy": m.get("price_jpy"),
+                    "price_raw": m.get("price_raw",""),
+                    "menu_url": m.get("menu_url",""),
+                    "pickup_flag": m.get("pickup_flag", False),
+                    "category_raw": m.get("category_raw",""),
+                })
+
+            # hours (正規化)
+            for day, raw in (c.get("hours") or {}).items():
+                open_t, close_t = split_hours(raw)
+                hours_rows.append({
+                    "timestamp_utc": ts,
+                    "clinic_id": clinic_id,
+                    "day": day,
+                    "open_time": open_t or "",
+                    "close_time": close_t or "",
+                    "raw": raw,
+                })
+
+    # 保存（CSV/JSON）
+    pd.DataFrame(clinics_rows).to_csv(os.path.join(out_dir, "clinics.csv"), index=False, encoding="utf-8-sig")
+    pd.DataFrame(menus_rows).to_csv(os.path.join(out_dir, "menus.csv"), index=False, encoding="utf-8-sig")
+    pd.DataFrame(hours_rows).to_csv(os.path.join(out_dir, "hours.csv"), index=False, encoding="utf-8-sig")
     with open(os.path.join(out_dir, "cards.json"), "w", encoding="utf-8") as f:
         json.dump(all_cards, f, ensure_ascii=False, indent=2)
-    print("[Saved] output/latest.csv")
-    print("[Saved] output/cards.json")
+    print("[Saved] output/clinics.csv, menus.csv, hours.csv, cards.json")
 
-    # スプシ
-    write_to_sheet(all_rows)
-    write_settings_sheet()
+    # Sheets 書き込み
+    write_to_sheets_multi(clinics_rows, menus_rows, hours_rows)
 
 if __name__ == "__main__":
     main()
