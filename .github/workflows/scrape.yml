@@ -1,7 +1,46 @@
 name: Scrape
-on: { workflow_dispatch: {} }
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_urls:
+        description: "Comma-separated URLs"
+        required: true
+        default: "https://kireireport.com/clinics/1929"
+      write_settings:
+        description: "Write settings sheet? (true/false)"
+        required: false
+        default: "true"
+
 jobs:
-  hello:
+  scrape:
     runs-on: ubuntu-latest
+    env:
+      TARGET_URLS: ${{ inputs.target_urls }}
+      OUTPUT_DIR: "output"
+      GSHEET_JSON_B64: ${{ secrets.GSHEET_JSON_B64 }}
+      GSHEET_KEY: ${{ secrets.GSHEET_KEY }}
+      GSHEET_WORKSHEET: scrape
+      WRITE_SETTINGS_SHEET: ${{ inputs.write_settings }}
+      SETTINGS_SHEET_NAME: "settings"
     steps:
-      - run: echo "Hello from Actions"
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests beautifulsoup4 pandas google-auth gspread
+      - name: Run scraper
+        run: python scripts/scrape.py
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: scrape-output
+          path: |
+            output/*.csv
+            output/*.json
+          if-no-files-found: warn
