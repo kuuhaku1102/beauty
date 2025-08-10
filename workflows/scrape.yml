@@ -8,14 +8,18 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      # ====== 必要に応じて編集 ======
-      TARGET_URLS: "https://example.com"   # カンマ区切りで複数指定OK
+      # ここをあなたのターゲットに変更済み
+      TARGET_URLS: "https://kireireport.com/clinics/1929"
       OUTPUT_DIR: "output"
-      # Google Sheets 連携（Secrets推奨。なければ自動でスキップ）
+
+      # Google Sheets（Secretsに登録しておく）
       GSHEET_JSON_B64: ${{ secrets.GSHEET_JSON_B64 }}
       GSHEET_KEY: ${{ secrets.GSHEET_KEY }}
-      GSHEET_WORKSHEET: ${{ secrets.GSHEET_WORKSHEET }}
-      # ============================
+      GSHEET_WORKSHEET: scrape
+
+      # 設定シートを書きたい時だけ true（普段はfalse/未設定でOK）
+      WRITE_SETTINGS_SHEET: "true"
+      SETTINGS_SHEET_NAME: "settings"
 
     steps:
       - name: Checkout
@@ -26,14 +30,13 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install deps (no requirements.txt needed)
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install requests beautifulsoup4 pandas google-auth gspread
 
       - name: Run scraper
-        run: |
-          python scripts/scrape.py
+        run: python scripts/scrape.py
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -43,4 +46,3 @@ jobs:
             output/*.csv
             output/*.json
           if-no-files-found: warn
-
