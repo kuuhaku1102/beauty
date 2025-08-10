@@ -5,87 +5,30 @@ import requests
 from bs4 import BeautifulSoup
 import pandas as pd
 
+# ---- Config ----
 USER_AGENT = "Mozilla/5.0 (compatible; ScraperBot/1.0; +https://github.com/your/repo)"
 TIMEOUT = 30
 RETRY = 3
-SLEEP_BETWEEN = 2
+SLEEP_BETWEEN = 2  # スクレイピング時のsleep（礼儀として少し）
 
+# ---- Utils ----
 def now_utc_iso():
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
-def clean_text(s): 
+def clean_text(s):
     return re.sub(r"\s+", " ", s).strip() if s else ""
 
 def to_int(s):
-    if not s: 
+    if not s:
         return None
     m = re.search(r"\d+", s.replace(",", ""))
     return int(m.group()) if m else None
-
-# -------- targets builder --------
-def build_target_urls():
-    """
-    優先度:
-      1) TARGET_URLS（URLのカンマ区切り）
-      2) CLINIC_IDS（数字のカンマ区切り → BASE_CLINIC_URL/<id>）
-      3) ID_FROM/ID_TO(/ID_STEP) の連番
-    併用OK（重複は除外）
-    """
-    urls_env = os.getenv("TARGET_URLS", "").strip()
-    ids_csv  = os.getenv("CLINIC_IDS", "").strip()
-    id_from  = os.getenv("ID_FROM", "").strip()
-    id_to    = os.getenv("ID_TO", "").strip()
-    id_step  = os.getenv("ID_STEP", "1").strip()
-    base     = os.getenv("BASE_CLINIC_URL", "https://kireireport.com/clinics").rstrip("/")
-
-    urls = set()
-
-    # 1) URLをそのまま
-    if urls_env:
-        for u in urls_env.split(","):
-            u = u.strip()
-            if u:
-                urls.add(u)
-
-    # 2) IDのCSV
-    if ids_csv:
-        for s in ids_csv.split(","):
-            s = s.strip()
-            if s.isdigit():
-                urls.add(f"{base}/{s}")
-
-    # 3) 連番
-    if id_from.isdigit() and id_to.isdigit():
-        a, b = int(id_from), int(id_to)
-        step = int(id_step) if id_step.lstrip("-").isdigit() else 1
-        step = step or 1
-        if a <= b and step > 0:
-            rng = range(a, b + 1, step)
-        elif a >= b and step < 0:
-            rng = range(a, b - 1, step)
-        else:
-            rng = range(min(a, b), max(a, b) + 1, abs(step))
-        for x in rng:
-            urls.add(f"{base}/{x}")
-
-    return sorted(urls)
 
 def get_clinic_id_from_url(u: str):
     m = re.search(r"/clinics/(\d+)", u or "")
     return m.group(1) if m else ""
 
-def save_targets(urls, out_dir):
-    """出力: output/targets.csv, output/targets.txt"""
-    os.makedirs(out_dir, exist_ok=True)
-    ts = now_utc_iso()
-    rows = [{"timestamp_utc": ts, "url": u, "clinic_id": get_clinic_id_from_url(u)} for u in urls]
-    pd.DataFrame(rows).to_csv(os.path.join(out_dir, "targets.csv"), index=False, encoding="utf-8-sig")
-    with open(os.path.join(out_dir, "targets.txt"), "w", encoding="utf-8") as f:
-        f.write("\n".join(urls) + "\n")
-    print(f"[Saved] output/targets.csv ({len(urls)} urls)")
-    print(f"[Saved] output/targets.txt")
-
-# -------- HTTP --------
+# ---- HTTP ----
 def fetch(url):
     last_exc = None
     for i in range(RETRY):
@@ -98,18 +41,50 @@ def fetch(url):
             time.sleep(SLEEP_BETWEEN * (i + 1))
     raise last_exc
 
-# -------- parse helpers --------
+def check_url_exists(url):
+    """存在確認（HEAD）。一部サイトでHEAD→GETが必要ならGETに切替えてください。"""
+    try:
+        r = requests.head(url, headers={"User-Agent": USER_AGENT}, timeout=5, allow_redirects=True)
+        # 一部環境では 405/403 を返すサイトもあるので、その場合はGETで再確認
+        if r.status_code in (405, 403):
+            r2 = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=10)
+            return r2.status_code == 200
+        return r.status_code == 200
+    except Exception:
+        return False
+
+# ---- URL discovery (0001〜9999) ----
+def build_target_urls_auto():
+    end_id_str = os.getenv("END_ID", "9999")
+    if not end_id_str.isdigit():
+        raise SystemExit("END_ID must be numeric")
+    end_id = int(end_id_str)
+
+    base_url = "https://kireireport.com/clinics"
+    valid_urls = []
+    for cid in range(1, end_id + 1):
+        url = f"{base_url}/{cid:04d}"  # 4桁ゼロ埋め
+        if check_url_exists(url):
+            valid_urls.append(url)
+            print(f"[OK] {url}")
+        else:
+            print(f"[NG] {url}")
+        # 探索は速くなりがちなので、ほんの少し待つ
+        time.sleep(0.05)
+    return valid_urls
+
+# ---- Parse helpers ----
 def parse_hours(table):
     hours = {}
-    if not table: 
+    if not table:
         return hours
     for tr in table.select("tbody > tr"):
         tds = tr.find_all("td")
-        if len(tds) < 2: 
+        if len(tds) < 2:
             continue
         day = clean_text(tds[0].get_text())
         time_text = clean_text(tds[1].get_text(" "))
-        if day: 
+        if day:
             hours[day] = time_text
     return hours
 
@@ -181,7 +156,7 @@ def parse_page(html, page_url):
         })
     return cards
 
-# -------- Sheets helpers --------
+# ---- Sheets helpers ----
 def get_gspread_client_from_b64(json_b64: str):
     import gspread
     from google.oauth2.service_account import Credentials
@@ -208,7 +183,7 @@ def write_to_sheet(rows):
     sheet_key = os.getenv("GSHEET_KEY")
     worksheet_name = os.getenv("GSHEET_WORKSHEET", "scrape")
     if not (json_b64 and sheet_key):
-        print("[Sheets] Skipped (env not set)."); 
+        print("[Sheets] Skipped (env not set).")
         return
     gc = get_gspread_client_from_b64(json_b64)
     sh = gc.open_by_key(sheet_key)
@@ -230,7 +205,7 @@ def write_settings_sheet():
     worksheet_name = os.getenv("GSHEET_WORKSHEET", "scrape")
     settings_sheet_name = os.getenv("SETTINGS_SHEET_NAME", "settings")
     if not (json_b64 and sheet_key):
-        print("[Settings] Skipped (env not set)."); 
+        print("[Settings] Skipped (env not set).")
         return
     gc = get_gspread_client_from_b64(json_b64)
     sh = gc.open_by_key(sheet_key)
@@ -250,13 +225,10 @@ def write_settings_sheet():
 
     now = now_utc_iso()
     values = [
-        {"key":"TARGET_URLS",       "value": os.getenv("TARGET_URLS",""),  "note":"スクレイピング対象URL(カンマ区切り)", "updated_utc": now},
-        {"key":"CLINIC_IDS",        "value": os.getenv("CLINIC_IDS",""),   "note":"IDのCSV（自動でURL化）",             "updated_utc": now},
-        {"key":"ID_FROM~TO~STEP",   "value": f"{os.getenv('ID_FROM','')}~{os.getenv('ID_TO','')}~{os.getenv('ID_STEP','')}", "note":"連番指定", "updated_utc": now},
-        {"key":"BASE_CLINIC_URL",   "value": os.getenv("BASE_CLINIC_URL",""), "note":"IDをURLにするときのベース",      "updated_utc": now},
-        {"key":"GSHEET_KEY",        "value": sheet_key,                     "note":"スプレッドシートID",                 "updated_utc": now},
-        {"key":"GSHEET_WORKSHEET",  "value": worksheet_name,                "note":"結果出力シート名",                   "updated_utc": now},
-        {"key":"GSHEET_JSON_B64",   "value": masked_summary(json_b64),      "note":"Secretsに格納。値は保存しない。",    "updated_utc": now},
+        {"key":"END_ID",            "value": os.getenv("END_ID",""),        "note":"探索の最終ID（0001〜END_ID）", "updated_utc": now},
+        {"key":"GSHEET_KEY",        "value": sheet_key,                     "note":"スプレッドシートID",          "updated_utc": now},
+        {"key":"GSHEET_WORKSHEET",  "value": worksheet_name,                "note":"結果出力シート名",            "updated_utc": now},
+        {"key":"GSHEET_JSON_B64",   "value": masked_summary(json_b64),      "note":"Secretsに格納。値は保存しない。", "updated_utc": now},
     ]
     append_rows(ws, values)
     print(f"[Settings] Wrote {len(values)} rows to '{settings_sheet_name}'.")
@@ -268,7 +240,7 @@ def write_targets_sheet(urls):
     json_b64 = os.getenv("GSHEET_JSON_B64")
     sheet_key = os.getenv("GSHEET_KEY")
     if not (json_b64 and sheet_key):
-        print("[targets sheet] Skipped (env not set)."); 
+        print("[targets sheet] Skipped (env not set).")
         return
     gc = get_gspread_client_from_b64(json_b64)
     sh = gc.open_by_key(sheet_key)
@@ -284,20 +256,28 @@ def write_targets_sheet(urls):
     append_rows(ws, rows)
     print(f"[targets sheet] +{len(rows)} rows -> {title}")
 
-# -------- main --------
+# ---- IO helpers ----
+def save_targets(urls, out_dir):
+    os.makedirs(out_dir, exist_ok=True)
+    ts = now_utc_iso()
+    rows = [{"timestamp_utc": ts, "url": u, "clinic_id": get_clinic_id_from_url(u)} for u in urls]
+    pd.DataFrame(rows).to_csv(os.path.join(out_dir, "targets.csv"), index=False, encoding="utf-8-sig")
+    with open(os.path.join(out_dir, "targets.txt"), "w", encoding="utf-8") as f:
+        f.write("\n".join(urls) + "\n")
+    print(f"[Saved] output/targets.csv ({len(urls)} urls)")
+    print(f"[Saved] output/targets.txt")
+
+# ---- main ----
 def main():
-    # ターゲットURLを構築
-    urls = build_target_urls()
+    # 0001〜END_ID まで存在確認して、あるURLだけを対象にする
+    urls = build_target_urls_auto()
     if not urls:
-        target_urls = os.getenv("TARGET_URLS", "").strip()
-        if not target_urls:
-            raise SystemExit("No targets: set TARGET_URLS or CLINIC_IDS or ID_FROM/ID_TO")
-        urls = [u.strip() for u in target_urls.split(",") if u.strip()]
+        raise SystemExit("No valid clinic pages found")
 
     out_dir = os.getenv("OUTPUT_DIR", "output")
     os.makedirs(out_dir, exist_ok=True)
 
-    # 使うURLを即保存＆（任意で）スプシにも記録
+    # URL一覧を保存＆（任意で）スプシにも記録
     save_targets(urls, out_dir)
     write_targets_sheet(urls)
 
@@ -324,6 +304,7 @@ def main():
                 "status": "ok",
                 "notes": ", ".join(notes)
             })
+        time.sleep(SLEEP_BETWEEN)
 
     # ローカル保存
     pd.DataFrame(all_rows).to_csv(os.path.join(out_dir, "latest.csv"), index=False, encoding="utf-8-sig")
