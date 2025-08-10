@@ -3,26 +3,6 @@ name: Scrape
 on:
   workflow_dispatch:
     inputs:
-      target_urls:
-        description: "Comma-separated URLs (optional)"
-        required: false
-        default: ""
-      clinic_ids:
-        description: "Comma-separated clinic IDs (optional, e.g. 1929,5727)"
-        required: false
-        default: ""
-      id_from:
-        description: "ID range start (inclusive, optional)"
-        required: false
-        default: ""
-      id_to:
-        description: "ID range end (inclusive, optional)"
-        required: false
-        default: ""
-      id_step:
-        description: "ID step (optional)"
-        required: false
-        default: "1"
       write_settings:
         description: "Write settings sheet? (true/false)"
         required: false
@@ -36,18 +16,13 @@ jobs:
   scrape:
     runs-on: ubuntu-latest
     env:
-      # 入力値
-      TARGET_URLS: ${{ inputs.target_urls }}
-      CLINIC_IDS: ${{ inputs.clinic_ids }}
-      ID_FROM: ${{ inputs.id_from }}
-      ID_TO: ${{ inputs.id_to }}
-      ID_STEP: ${{ inputs.id_step }}
-      BASE_CLINIC_URL: "https://kireireport.com/clinics"
+      # 0001〜9999 まで探索
+      END_ID: "9999"
 
       # 出力
       OUTPUT_DIR: "output"
 
-      # Google Sheets（リポジトリSecretsに入れておく）
+      # Google Sheets（リポジトリの Secrets に入れておく）
       GSHEET_JSON_B64: ${{ secrets.GSHEET_JSON_B64 }}
       GSHEET_KEY: ${{ secrets.GSHEET_KEY }}
       GSHEET_WORKSHEET: scrape
@@ -57,6 +32,7 @@ jobs:
       SETTINGS_SHEET_NAME: "settings"
       WRITE_TARGETS_SHEET: ${{ inputs.write_targets_sheet }}
       TARGETS_SHEET_NAME: "targets"
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
