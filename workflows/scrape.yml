@@ -23,7 +23,6 @@ jobs:
       GSHEET_WORKSHEET: scrape
       WRITE_SETTINGS_SHEET: ${{ inputs.write_settings }}
       SETTINGS_SHEET_NAME: "settings"
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
