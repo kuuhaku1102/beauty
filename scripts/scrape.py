@@ -9,7 +9,7 @@ import pandas as pd
 USER_AGENT = "Mozilla/5.0 (compatible; ScraperBot/1.0; +https://github.com/your/repo)"
 TIMEOUT = 30
 RETRY = 3
-SLEEP_BETWEEN = 2  # スクレイピング時のsleep（礼儀として少し）
+SLEEP_BETWEEN = 2  # ページGETの間隔（マナー用）
 
 # ---- Utils ----
 def now_utc_iso():
@@ -28,6 +28,24 @@ def get_clinic_id_from_url(u: str):
     m = re.search(r"/clinics/(\d+)", u or "")
     return m.group(1) if m else ""
 
+def load_urls_from_env():
+    """
+    環境変数 TARGET_URLS があればカンマ/改行区切りでURL配列にして返す（重複除去）。
+    """
+    raw = os.getenv("TARGET_URLS", "").strip()
+    if not raw:
+        return []
+    parts = re.split(r"[,\n\r]+", raw)
+    urls, seen = [], set()
+    for p in parts:
+        u = p.strip().rstrip()
+        if not u: 
+            continue
+        if u not in seen:
+            urls.append(u)
+            seen.add(u)
+    return urls
+
 # ---- HTTP ----
 def fetch(url):
     last_exc = None
@@ -42,10 +60,11 @@ def fetch(url):
     raise last_exc
 
 def check_url_exists(url):
-    """存在確認（HEAD）。一部サイトでHEAD→GETが必要ならGETに切替えてください。"""
+    """
+    存在確認（HEAD→必要ならGET）
+    """
     try:
         r = requests.head(url, headers={"User-Agent": USER_AGENT}, timeout=5, allow_redirects=True)
-        # 一部環境では 405/403 を返すサイトもあるので、その場合はGETで再確認
         if r.status_code in (405, 403):
             r2 = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=10)
             return r2.status_code == 200
@@ -53,13 +72,12 @@ def check_url_exists(url):
     except Exception:
         return False
 
-# ---- URL discovery (0001〜9999) ----
+# ---- URL discovery (0001〜END_ID) ----
 def build_target_urls_auto():
     end_id_str = os.getenv("END_ID", "9999")
     if not end_id_str.isdigit():
         raise SystemExit("END_ID must be numeric")
     end_id = int(end_id_str)
-
     base_url = "https://kireireport.com/clinics"
     valid_urls = []
     for cid in range(1, end_id + 1):
@@ -69,12 +87,16 @@ def build_target_urls_auto():
             print(f"[OK] {url}")
         else:
             print(f"[NG] {url}")
-        # 探索は速くなりがちなので、ほんの少し待つ
-        time.sleep(0.05)
+        time.sleep(0.05)  # やや控えめに
     return valid_urls
 
 # ---- Parse helpers ----
+TIME_RANGE_RE = re.compile(r"(?P<open>\d{1,2}:\d{2}).*?(?P<close>\d{1,2}:\d{2})")
+
 def parse_hours(table):
+    """
+    return: dict[day] -> raw string
+    """
     hours = {}
     if not table:
         return hours
@@ -87,6 +109,14 @@ def parse_hours(table):
         if day:
             hours[day] = time_text
     return hours
+
+def split_open_close(raw):
+    if not raw:
+        return "", ""
+    m = TIME_RANGE_RE.search(raw)
+    if not m:
+        return "", ""
+    return m.group("open"), m.group("close")
 
 def parse_card(card, base_url=None):
     rank_el = card.select_one(".number_ranked")
@@ -112,7 +142,8 @@ def parse_card(card, base_url=None):
 
     images = [img.get("src") for img in card.select(".card__image-list img.card__image[src]")]
     features = [clean_text(li.get_text()) for li in card.select(".card__feature-list .card__feature")]
-    access_text = clean_text(card.select_one(".card__access-text") and card.select_one(".card__access-text").get_text())
+    access_text = clean_text(card.select_one(".card__detail") and card.select_one(".card__detail").get_text()) \
+                  or clean_text(card.select_one(".card__access-text") and card.select_one(".card__access-text").get_text())
 
     menus = []
     for li in card.select("ul li a.small-list__item"):
@@ -134,13 +165,13 @@ def parse_card(card, base_url=None):
             "url": menu_url, "pickup_flag": pickup, "category_raw": cat
         })
 
-    hours = parse_hours(card.select_one("table.table"))
+    hours_table = parse_hours(card.select_one("table.table"))
     return {
         "rank": rank, "name": name, "clinic_url": clinic_url,
         "rating": rating, "reviews": reviews,
         "snippet": snippet, "snippet_author": snippet_author,
         "images": images, "features": features, "access": access_text,
-        "hours": hours, "menus": menus
+        "hours": hours_table, "menus": menus
     }
 
 def parse_page(html, page_url):
@@ -178,31 +209,67 @@ def append_rows(ws, rows):
     if values:
         ws.append_rows(values, value_input_option="RAW")
 
-def write_to_sheet(rows):
+# ==== 3シートへの書き込み ====
+CLINICS_SHEET = os.getenv("CLINICS_SHEET_NAME", "clinics")
+MENUS_SHEET   = os.getenv("MENUS_SHEET_NAME", "menus")
+HOURS_SHEET   = os.getenv("HOURS_SHEET_NAME", "hours")
+
+CLINICS_HEADER = [
+    "timestamp_utc","clinic_id","name","rank","rating","reviews_count",
+    "clinic_url","source_page_url","access_text","snippet","snippet_author",
+    "images_csv","features_csv","hours_json","last_seen_utc","status","notes"
+]
+
+MENUS_HEADER = [
+    "timestamp_utc","clinic_id","menu_title","price_jpy","price_raw","menu_url","pickup_flag","category_raw"
+]
+
+HOURS_HEADER = [
+    "timestamp_utc","clinic_id","day","open_time","close_time","raw"
+]
+
+def write_three_sheets(clinics_rows, menus_rows, hours_rows):
     json_b64 = os.getenv("GSHEET_JSON_B64")
     sheet_key = os.getenv("GSHEET_KEY")
-    worksheet_name = os.getenv("GSHEET_WORKSHEET", "scrape")
     if not (json_b64 and sheet_key):
         print("[Sheets] Skipped (env not set).")
         return
     gc = get_gspread_client_from_b64(json_b64)
     sh = gc.open_by_key(sheet_key)
-    try:
-        ws = sh.worksheet(worksheet_name)
-    except Exception:
-        ws = sh.add_worksheet(title=worksheet_name, rows=2000, cols=20)
-    header = ["timestamp_utc","source","url","title","h1","status","notes"]
-    ensure_header(ws, header)
-    append_rows(ws, rows)
-    print(f"[Sheets] Appended {len(rows)} rows to '{worksheet_name}'.")
 
+    # clinics
+    try:
+        ws_c = sh.worksheet(CLINICS_SHEET)
+    except Exception:
+        ws_c = sh.add_worksheet(title=CLINICS_SHEET, rows=5000, cols=len(CLINICS_HEADER))
+    ensure_header(ws_c, CLINICS_HEADER)
+    append_rows(ws_c, clinics_rows)
+    print(f"[Sheets] clinics +{len(clinics_rows)}")
+
+    # menus
+    try:
+        ws_m = sh.worksheet(MENUS_SHEET)
+    except Exception:
+        ws_m = sh.add_worksheet(title=MENUS_SHEET, rows=5000, cols=len(MENUS_HEADER))
+    ensure_header(ws_m, MENUS_HEADER)
+    append_rows(ws_m, menus_rows)
+    print(f"[Sheets] menus +{len(menus_rows)}")
+
+    # hours
+    try:
+        ws_h = sh.worksheet(HOURS_SHEET)
+    except Exception:
+        ws_h = sh.add_worksheet(title=HOURS_SHEET, rows=5000, cols=len(HOURS_HEADER))
+    ensure_header(ws_h, HOURS_HEADER)
+    append_rows(ws_h, hours_rows)
+    print(f"[Sheets] hours +{len(hours_rows)}")
+
+# ---- 設定/ターゲット補助（任意）----
 def write_settings_sheet():
-    """settings シートに機微情報を漏らさず記録（JSONはマスク表記のみ）。"""
     if os.getenv("WRITE_SETTINGS_SHEET", "").lower() != "true":
         return
     json_b64 = os.getenv("GSHEET_JSON_B64")
     sheet_key = os.getenv("GSHEET_KEY")
-    worksheet_name = os.getenv("GSHEET_WORKSHEET", "scrape")
     settings_sheet_name = os.getenv("SETTINGS_SHEET_NAME", "settings")
     if not (json_b64 and sheet_key):
         print("[Settings] Skipped (env not set).")
@@ -225,16 +292,17 @@ def write_settings_sheet():
 
     now = now_utc_iso()
     values = [
-        {"key":"END_ID",            "value": os.getenv("END_ID",""),        "note":"探索の最終ID（0001〜END_ID）", "updated_utc": now},
-        {"key":"GSHEET_KEY",        "value": sheet_key,                     "note":"スプレッドシートID",          "updated_utc": now},
-        {"key":"GSHEET_WORKSHEET",  "value": worksheet_name,                "note":"結果出力シート名",            "updated_utc": now},
-        {"key":"GSHEET_JSON_B64",   "value": masked_summary(json_b64),      "note":"Secretsに格納。値は保存しない。", "updated_utc": now},
+        {"key":"END_ID",              "value": os.getenv("END_ID",""), "note":"探索の最終ID（0001〜END_ID）", "updated_utc": now},
+        {"key":"CLINICS_SHEET_NAME",  "value": CLINICS_SHEET,          "note":"クリニック出力シート",        "updated_utc": now},
+        {"key":"MENUS_SHEET_NAME",    "value": MENUS_SHEET,            "note":"メニュー出力シート",          "updated_utc": now},
+        {"key":"HOURS_SHEET_NAME",    "value": HOURS_SHEET,            "note":"営業時間出力シート",          "updated_utc": now},
+        {"key":"GSHEET_KEY",          "value": sheet_key,              "note":"スプレッドシートID",           "updated_utc": now},
+        {"key":"GSHEET_JSON_B64",     "value": masked_summary(json_b64),"note":"Secretsに格納。値は保存しない。", "updated_utc": now},
     ]
     append_rows(ws, values)
-    print(f"[Settings] Wrote {len(values)} rows to '{settings_sheet_name}'.")
+    print(f"[Settings] wrote to '{settings_sheet_name}'.")
 
 def write_targets_sheet(urls):
-    """シート 'targets' にURL一覧を追記（フラグでON/OFF）"""
     if os.getenv("WRITE_TARGETS_SHEET", "").lower() != "true":
         return
     json_b64 = os.getenv("GSHEET_JSON_B64")
@@ -257,64 +325,114 @@ def write_targets_sheet(urls):
     print(f"[targets sheet] +{len(rows)} rows -> {title}")
 
 # ---- IO helpers ----
-def save_targets(urls, out_dir):
-    os.makedirs(out_dir, exist_ok=True)
-    ts = now_utc_iso()
-    rows = [{"timestamp_utc": ts, "url": u, "clinic_id": get_clinic_id_from_url(u)} for u in urls]
-    pd.DataFrame(rows).to_csv(os.path.join(out_dir, "targets.csv"), index=False, encoding="utf-8-sig")
-    with open(os.path.join(out_dir, "targets.txt"), "w", encoding="utf-8") as f:
-        f.write("\n".join(urls) + "\n")
-    print(f"[Saved] output/targets.csv ({len(urls)} urls)")
-    print(f"[Saved] output/targets.txt")
+def save_csv(df, path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    df.to_csv(path, index=False, encoding="utf-8-sig")
+    print(f"[Saved] {path}")
 
 # ---- main ----
 def main():
-    # 0001〜END_ID まで存在確認して、あるURLだけを対象にする
-    urls = build_target_urls_auto()
+    # 1) 手動指定URL（TARGET_URLS）を最優先
+    urls = load_urls_from_env()
+
+    # 2) 無ければ 0001〜END_ID の自動探索
+    if not urls:
+        urls = build_target_urls_auto()
+
     if not urls:
         raise SystemExit("No valid clinic pages found")
 
     out_dir = os.getenv("OUTPUT_DIR", "output")
     os.makedirs(out_dir, exist_ok=True)
 
-    # URL一覧を保存＆（任意で）スプシにも記録
-    save_targets(urls, out_dir)
-    write_targets_sheet(urls)
+    write_targets_sheet(urls)  # 任意でtargetsシートに記録
 
-    all_rows, all_cards = [], []
     ts = now_utc_iso()
+    clinics_rows, menus_rows, hours_rows = [], [], []
+    all_cards = []
 
-    for url in urls:
-        print(f"[Fetch] {url}")
-        html = fetch(url)
-        cards = parse_page(html, url)
+    for source_page_url in urls:
+        print(f"[Fetch] {source_page_url}")
+        html = fetch(source_page_url)
+        cards = parse_page(html, source_page_url)
         all_cards.extend(cards)
+
         for c in cards:
+            clinic_id = get_clinic_id_from_url(c.get("clinic_url") or source_page_url)
+            images_csv   = ",".join([x for x in c.get("images", []) if x])
+            features_csv = ",".join([x for x in c.get("features", []) if x])
+            hours_json   = json.dumps(c.get("hours", {}), ensure_ascii=False)
+
             notes = []
             if c.get("rating") is not None:
                 notes.append(f"rating={c['rating']}")
             if c.get("reviews") is not None:
                 notes.append(f"reviews={c['reviews']}")
-            all_rows.append({
+            notes_str = ", ".join(notes)
+
+            # clinics
+            clinics_rows.append({
                 "timestamp_utc": ts,
-                "source": "requests",
-                "url": c.get("clinic_url", url),
-                "title": c.get("name",""),
-                "h1": c.get("name",""),
+                "clinic_id": clinic_id,
+                "name": c.get("name",""),
+                "rank": c.get("rank"),
+                "rating": c.get("rating"),
+                "reviews_count": c.get("reviews"),
+                "clinic_url": c.get("clinic_url") or source_page_url,
+                "source_page_url": source_page_url,
+                "access_text": c.get("access",""),
+                "snippet": c.get("snippet",""),
+                "snippet_author": c.get("snippet_author",""),
+                "images_csv": images_csv,
+                "features_csv": features_csv,
+                "hours_json": hours_json,
+                "last_seen_utc": ts,
                 "status": "ok",
-                "notes": ", ".join(notes)
+                "notes": notes_str
             })
+
+            # menus
+            for m in c.get("menus", []):
+                menus_rows.append({
+                    "timestamp_utc": ts,
+                    "clinic_id": clinic_id,
+                    "menu_title": m.get("title",""),
+                    "price_jpy": m.get("price_jpy"),
+                    "price_raw": m.get("price_raw",""),
+                    "menu_url": m.get("url",""),
+                    "pickup_flag": m.get("pickup_flag"),
+                    "category_raw": m.get("category_raw",""),
+                })
+
+            # hours
+            for day, raw in (c.get("hours") or {}).items():
+                open_time, close_time = split_open_close(raw)
+                hours_rows.append({
+                    "timestamp_utc": ts,
+                    "clinic_id": clinic_id,
+                    "day": day,
+                    "open_time": open_time,
+                    "close_time": close_time,
+                    "raw": raw
+                })
+
         time.sleep(SLEEP_BETWEEN)
 
     # ローカル保存
-    pd.DataFrame(all_rows).to_csv(os.path.join(out_dir, "latest.csv"), index=False, encoding="utf-8-sig")
+    df_clinics = pd.DataFrame(clinics_rows, columns=CLINICS_HEADER)
+    df_menus   = pd.DataFrame(menus_rows,   columns=MENUS_HEADER)
+    df_hours   = pd.DataFrame(hours_rows,   columns=HOURS_HEADER)
+
+    save_csv(df_clinics, os.path.join(out_dir, "clinics.csv"))
+    save_csv(df_menus,   os.path.join(out_dir, "menus.csv"))
+    save_csv(df_hours,   os.path.join(out_dir, "hours.csv"))
+
     with open(os.path.join(out_dir, "cards.json"), "w", encoding="utf-8") as f:
         json.dump(all_cards, f, ensure_ascii=False, indent=2)
-    print("[Saved] output/latest.csv")
     print("[Saved] output/cards.json")
 
-    # シート書き込み
-    write_to_sheet(all_rows)
+    # スプレッドシートへ書き込み
+    write_three_sheets(clinics_rows, menus_rows, hours_rows)
     write_settings_sheet()
 
 if __name__ == "__main__":
