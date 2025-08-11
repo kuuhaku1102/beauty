@@ -31,18 +31,16 @@ def get_clinic_id_from_url(u: str):
 def load_urls_from_env():
     """
     TARGET_URLS から URL 群を抽出。
-    改行/カンマはもちろん、完全連結（…0001https://…0002…）にも対応。
+    改行/カンマ/タブ混入や連結にも強い抽出。
     """
     raw = os.getenv("TARGET_URLS", "") or ""
     flat = re.sub(r"[\s,]+", " ", raw.strip())
-    # http(s)で始まり、次の http(s) or 空白/行末手前まで（非貪欲）
     found = re.findall(r"https?://.*?(?=https?://|\s|$)", flat)
     uniq, seen = [], set()
     for u in found:
         u = u.strip()
         if u and u not in seen:
-            uniq.append(u)
-            seen.add(u)
+            uniq.append(u); seen.add(u)
     return uniq
 
 # ---- HTTP ----
@@ -125,8 +123,50 @@ def pick_img_src(img_tag):
         return first
     return ""
 
+def to_abs_url(maybe_url: str, page_url: str) -> str:
+    if not maybe_url:
+        return ""
+    if maybe_url.startswith("http://") or maybe_url.startswith("https://"):
+        return maybe_url
+    if maybe_url.startswith("//"):
+        return "https:" + maybe_url
+    return urljoin(page_url, maybe_url)
+
+def fetch_menu_image_from_detail(url):
+    """メニュー詳細ページから代表画像を取得。優先: og:image → .kds-line-height-0 img → 最初の img"""
+    try:
+        html = fetch(url)
+    except Exception as e:
+        print(f"[menu_img] fetch failed: {url} ({e})")
+        return ""
+    soup = BeautifulSoup(html, "html.parser")
+
+    # 1) og:image
+    og = soup.select_one('meta[property="og:image"]')
+    if og and og.get("content"):
+        return to_abs_url(og.get("content").strip(), url)
+
+    # 2) ご提示の構造
+    tag = soup.select_one(".kds-line-height-0 img")
+    if tag:
+        src = pick_img_src(tag)
+        if src:
+            return to_abs_url(src, url)
+
+    # 3) 最初の img
+    tag = soup.find("img")
+    if tag:
+        src = pick_img_src(tag)
+        if src:
+            return to_abs_url(src, url)
+
+    print(f"[menu_img] not found in detail: {url}")
+    return ""
+
 def extract_menus_from_scope(scope, base_url=None):
     menus = []
+    follow_detail = (os.getenv("MENU_IMG_FOLLOW", "true").lower() == "true")
+
     for a in scope.select("a.small-list__item"):
         title = clean_text(a.select_one(".small-list__title") and a.select_one(".small-list__title").get_text())
         price_text = clean_text(a.select_one(".small-list__price") and a.select_one(".small-list__price").get_text())
@@ -137,14 +177,22 @@ def extract_menus_from_scope(scope, base_url=None):
                 price_jpy = int(m.group(1).replace(",", ""))
             except:
                 pass
+
         href = a.get("href") or ""
         menu_url = urljoin(base_url, href) if base_url else href
         pickup = bool(a.select_one(".pickup-label_active"))
         cat = clean_text(a.select_one(".treatment-category") and a.select_one(".treatment-category").get_text())
 
-        # 画像取得（優先: .kds-line-height-0 img → .small-list__icon img → 最初の img）
+        # 一覧内（アンカー内）で一応探す
         img_tag = a.select_one(".kds-line-height-0 img") or a.select_one(".small-list__icon img") or a.find("img")
         menu_img = pick_img_src(img_tag)
+        if menu_img:
+            menu_img = to_abs_url(menu_img, menu_url or base_url or "")
+
+        # 見つからなければ詳細ページで取得
+        if not menu_img and follow_detail and menu_url:
+            menu_img = fetch_menu_image_from_detail(menu_url)
+            time.sleep(0.2)  # polite
 
         menus.append({
             "title": title,
@@ -252,7 +300,7 @@ CLINICS_HEADER = [
 ]
 MENUS_HEADER = [
     "timestamp_utc","clinic_id","menu_title","price_jpy","price_raw",
-    "menu_url","pickup_flag","category_raw","menu_img"  # ← 追加
+    "menu_url","pickup_flag","category_raw","menu_img"
 ]
 HOURS_HEADER = [
     "timestamp_utc","clinic_id","day","open_time","close_time","raw"
@@ -320,6 +368,7 @@ def write_settings_sheet():
         {"key":"HOURS_SHEET_NAME", "value": HOURS_SHEET, "note":"営業時間出力", "updated_utc": now},
         {"key":"GSHEET_KEY", "value": sheet_key, "note":"スプレッドシートID", "updated_utc": now},
         {"key":"GSHEET_JSON_B64", "value": masked_summary(json_b64), "note":"Secrets。値は保存しない。", "updated_utc": now},
+        {"key":"MENU_IMG_FOLLOW", "value": os.getenv("MENU_IMG_FOLLOW","true"), "note":"詳細ページまで追跡して画像取得", "updated_utc": now},
     ]
     append_rows(ws, rows)
     print(f"[Settings] wrote {len(rows)} rows")
