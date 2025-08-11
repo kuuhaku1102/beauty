@@ -7,7 +7,6 @@ on:
         description: "Comma or newline separated URLs (optional)"
         required: false
         default: |
-
       write_settings:
         description: "Write settings sheet? (true/false)"
         required: false
@@ -21,26 +20,19 @@ jobs:
   scrape:
     runs-on: ubuntu-latest
     env:
-      # 自動探索の上限（0001〜END_ID）
       END_ID: "9999"
-
-      # 出力フォルダ
       OUTPUT_DIR: "output"
 
-      # Google Sheets（Secrets に登録）
       GSHEET_JSON_B64: ${{ secrets.GSHEET_JSON_B64 }}
       GSHEET_KEY: ${{ secrets.GSHEET_KEY }}
 
-      # 手動入力（優先）
       TARGET_URLS: ${{ inputs.target_urls }}
 
-      # オプション（設定記録、URL記録）
       WRITE_SETTINGS_SHEET: ${{ inputs.write_settings }}
       SETTINGS_SHEET_NAME: "settings"
       WRITE_TARGETS_SHEET: ${{ inputs.write_targets_sheet }}
       TARGETS_SHEET_NAME: "targets"
 
-      # 出力先シート名
       CLINICS_SHEET_NAME: "clinics"
       MENUS_SHEET_NAME:   "menus"
       HOURS_SHEET_NAME:   "hours"
