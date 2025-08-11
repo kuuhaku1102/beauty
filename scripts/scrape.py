@@ -112,6 +112,19 @@ def split_open_close(raw):
         return "", ""
     return m.group("open"), m.group("close")
 
+def pick_img_src(img_tag):
+    """src を優先、無ければ srcset の先頭URLを返す"""
+    if not img_tag:
+        return ""
+    src = (img_tag.get("src") or "").strip()
+    if src:
+        return src
+    srcset = (img_tag.get("srcset") or "").strip()
+    if srcset:
+        first = srcset.split(",")[0].strip().split(" ")[0]
+        return first
+    return ""
+
 def extract_menus_from_scope(scope, base_url=None):
     menus = []
     for a in scope.select("a.small-list__item"):
@@ -128,9 +141,19 @@ def extract_menus_from_scope(scope, base_url=None):
         menu_url = urljoin(base_url, href) if base_url else href
         pickup = bool(a.select_one(".pickup-label_active"))
         cat = clean_text(a.select_one(".treatment-category") and a.select_one(".treatment-category").get_text())
+
+        # 画像取得（優先: .kds-line-height-0 img → .small-list__icon img → 最初の img）
+        img_tag = a.select_one(".kds-line-height-0 img") or a.select_one(".small-list__icon img") or a.find("img")
+        menu_img = pick_img_src(img_tag)
+
         menus.append({
-            "title": title, "price_jpy": price_jpy, "price_raw": price_text,
-            "url": menu_url, "pickup_flag": pickup, "category_raw": cat
+            "title": title,
+            "price_jpy": price_jpy,
+            "price_raw": price_text,
+            "url": menu_url,
+            "pickup_flag": pickup,
+            "category_raw": cat,
+            "menu_img": menu_img,
         })
     return menus
 
@@ -228,7 +251,8 @@ CLINICS_HEADER = [
     "images_csv","features_csv","hours_json","last_seen_utc","status","notes"
 ]
 MENUS_HEADER = [
-    "timestamp_utc","clinic_id","menu_title","price_jpy","price_raw","menu_url","pickup_flag","category_raw"
+    "timestamp_utc","clinic_id","menu_title","price_jpy","price_raw",
+    "menu_url","pickup_flag","category_raw","menu_img"  # ← 追加
 ]
 HOURS_HEADER = [
     "timestamp_utc","clinic_id","day","open_time","close_time","raw"
@@ -394,7 +418,7 @@ def main():
                 "source_page_url": source_page_url,
                 "access_text": c.get("access",""),
                 "snippet": c.get("snippet",""),
-                "snippet_author": c.get("snippet","") and c.get("snippet_author",""),
+                "snippet_author": c.get("snippet_author",""),
                 "images_csv": images_csv,
                 "features_csv": features_csv,
                 "hours_json": hours_json,
@@ -414,6 +438,7 @@ def main():
                     "menu_url": m.get("url",""),
                     "pickup_flag": m.get("pickup_flag"),
                     "category_raw": m.get("category_raw",""),
+                    "menu_img": m.get("menu_img",""),
                 })
 
             # hours
