@@ -30,16 +30,18 @@ def get_clinic_id_from_url(u: str):
 
 def load_urls_from_env():
     """
-    環境変数 TARGET_URLS からURL群を取り出す。
-    改行/カンマ/スペースが潰れて1行に連結されたケースにも対応するため、
-    http(s)で始まる塊を正規表現で抽出する。
+    環境変数 TARGET_URLS からURL群を抽出。
+    改行/カンマはもちろん、完全連結
+    （例: https://a.comhttps://b.com）にも対応。
     """
     raw = os.getenv("TARGET_URLS", "") or ""
-    # 通常の区切り（改行/カンマ）で一次分割
-    parts = re.split(r"[,\n\r]+", raw)
-    text = " ".join(p.strip() for p in parts if p.strip()) or raw
-    # http(s)で始まるトークンをすべて抽出
-    found = re.findall(r"https?://[^\s,]+", text)
+    # 空白やカンマをスペースに正規化（無くてもOKだが念のため）
+    flat = re.sub(r"[\s,]+", " ", raw.strip())
+
+    # http(s) で始まり、次の http(s) か空白/行末の直前までを非貪欲に取得
+    # これで連結ケースも 1 件ずつ拾える
+    found = re.findall(r"https?://.*?(?=https?://|\s|$)", flat)
+
     # 重複除去（順序維持）
     uniq, seen = [], set()
     for u in found:
