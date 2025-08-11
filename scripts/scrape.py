@@ -30,21 +30,24 @@ def get_clinic_id_from_url(u: str):
 
 def load_urls_from_env():
     """
-    環境変数 TARGET_URLS があればカンマ/改行区切りでURL配列にして返す（重複除去）。
+    環境変数 TARGET_URLS からURL群を取り出す。
+    改行/カンマ/スペースが潰れて1行に連結されたケースにも対応するため、
+    http(s)で始まる塊を正規表現で抽出する。
     """
-    raw = os.getenv("TARGET_URLS", "").strip()
-    if not raw:
-        return []
+    raw = os.getenv("TARGET_URLS", "") or ""
+    # 通常の区切り（改行/カンマ）で一次分割
     parts = re.split(r"[,\n\r]+", raw)
-    urls, seen = [], set()
-    for p in parts:
-        u = p.strip().rstrip()
-        if not u: 
-            continue
-        if u not in seen:
-            urls.append(u)
+    text = " ".join(p.strip() for p in parts if p.strip()) or raw
+    # http(s)で始まるトークンをすべて抽出
+    found = re.findall(r"https?://[^\s,]+", text)
+    # 重複除去（順序維持）
+    uniq, seen = [], set()
+    for u in found:
+        u = u.strip()
+        if u and u not in seen:
+            uniq.append(u)
             seen.add(u)
-    return urls
+    return uniq
 
 # ---- HTTP ----
 def fetch(url):
