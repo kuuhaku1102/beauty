@@ -25,7 +25,7 @@ jobs:
   scrape:
     runs-on: ubuntu-latest
     env:
-      # 指定がない場合の自動探索上限（0001〜END_ID）
+      # 自動探索の上限（0001〜END_ID）
       END_ID: "9999"
 
       # 出力フォルダ
@@ -35,16 +35,16 @@ jobs:
       GSHEET_JSON_B64: ${{ secrets.GSHEET_JSON_B64 }}
       GSHEET_KEY: ${{ secrets.GSHEET_KEY }}
 
-      # 手動入力を環境変数に渡す（優先）
+      # 手動入力（優先）
       TARGET_URLS: ${{ inputs.target_urls }}
 
-      # オプション（設定記録、ターゲットURL記録）
+      # オプション（設定記録、URL記録）
       WRITE_SETTINGS_SHEET: ${{ inputs.write_settings }}
       SETTINGS_SHEET_NAME: "settings"
       WRITE_TARGETS_SHEET: ${{ inputs.write_targets_sheet }}
       TARGETS_SHEET_NAME: "targets"
 
-      # 出力先シート名（必要なら変更）
+      # 出力先シート名
       CLINICS_SHEET_NAME: "clinics"
       MENUS_SHEET_NAME:   "menus"
       HOURS_SHEET_NAME:   "hours"
