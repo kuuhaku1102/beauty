@@ -266,6 +266,41 @@ def parse_page(html, page_url):
         })
     return cards, soup
 
+# ---- パンくず ----
+def parse_breadcrumbs(soup, page_url):
+    """
+    パンくず（.breadcrumb）からテキスト配列と主要要素（prefecture/city/station）を抽出
+    """
+    nav = soup.select_one("nav.breadcrumb") or soup.select_one(".breadcrumb")
+    items_text = []
+    if nav:
+        # a と p（最後の要素が p の場合）両方拾う
+        for el in nav.select(".breadcrumb__container .breadcrumb__item a, .breadcrumb__container .breadcrumb__item_last .breadcrumb__link, .breadcrumb__container .breadcrumb__item p"):
+            t = clean_text(el.get_text())
+            if t:
+                items_text.append(t)
+
+    prefecture = ""
+    city = ""
+    station = ""
+    for t in items_text:
+        if not prefecture and re.search(r"(都|道|府|県)$", t):
+            prefecture = t
+            continue
+        if not city and re.search(r"(市|区|町|村)$", t):
+            city = t
+            continue
+        if not station and t.endswith("駅"):
+            station = t
+            continue
+
+    return {
+        "breadcrumb_list": items_text,
+        "prefecture": prefecture,
+        "city": city,
+        "station": station,
+    }
+
 # ---- Sheets helpers ----
 def get_gspread_client_from_b64(json_b64: str):
     import gspread
@@ -295,8 +330,10 @@ HOURS_SHEET   = os.getenv("HOURS_SHEET_NAME", "hours")
 
 CLINICS_HEADER = [
     "timestamp_utc","clinic_id","name","rank","rating","reviews_count",
-    "clinic_url","source_page_url","access_text","snippet","snippet_author",
-    "images_csv","features_csv","hours_json","last_seen_utc","status","notes"
+    "clinic_url","source_page_url","prefecture","city","station",
+    "access_text","snippet","snippet_author",
+    "images_csv","features_csv","hours_json","breadcrumb_json",
+    "last_seen_utc","status","notes"
 ]
 MENUS_HEADER = [
     "timestamp_utc","clinic_id","menu_title","price_jpy","price_raw",
@@ -422,6 +459,14 @@ def main():
         cards, soup = parse_page(html, source_page_url)
         all_cards.extend(cards)
 
+        # パンくず抽出（ページ単位）
+        bc = parse_breadcrumbs(soup, source_page_url)
+        breadcrumb_list = bc.get("breadcrumb_list", [])
+        prefecture = bc.get("prefecture", "")
+        city = bc.get("city", "")
+        station = bc.get("station", "")
+        breadcrumb_json = json.dumps(breadcrumb_list, ensure_ascii=False)
+
         for c in cards:
             clinic_url = c.get("clinic_url") or source_page_url
             clinic_id = get_clinic_id_from_url(clinic_url)
@@ -465,12 +510,16 @@ def main():
                 "reviews_count": c.get("reviews"),
                 "clinic_url": clinic_url,
                 "source_page_url": source_page_url,
+                "prefecture": prefecture,
+                "city": city,
+                "station": station,
                 "access_text": c.get("access",""),
                 "snippet": c.get("snippet",""),
                 "snippet_author": c.get("snippet_author",""),
                 "images_csv": images_csv,
                 "features_csv": features_csv,
                 "hours_json": hours_json,
+                "breadcrumb_json": breadcrumb_json,
                 "last_seen_utc": ts,
                 "status": "ok",
                 "notes": notes_str
