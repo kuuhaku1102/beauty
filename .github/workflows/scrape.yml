@@ -16,23 +16,39 @@ on:
         required: false
         default: "true"
 
+# 連打しても前の実行を自動キャンセルしない
+concurrency:
+  group: scrape-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   scrape:
     runs-on: ubuntu-latest
+
+    # 長時間スクレイプのタイムアウト緩和（最大6時間）
+    timeout-minutes: 360
+
     env:
+      # 自動探索の上限（0001〜END_ID、TARGET_URLS が空のときに使用）
       END_ID: "9999"
+
+      # 出力フォルダ
       OUTPUT_DIR: "output"
 
+      # Google Sheets（Secrets に登録）
       GSHEET_JSON_B64: ${{ secrets.GSHEET_JSON_B64 }}
       GSHEET_KEY: ${{ secrets.GSHEET_KEY }}
 
+      # 手動入力（優先。空なら END_ID を使って自動生成）
       TARGET_URLS: ${{ inputs.target_urls }}
 
+      # オプション（設定記録、URL記録）
       WRITE_SETTINGS_SHEET: ${{ inputs.write_settings }}
       SETTINGS_SHEET_NAME: "settings"
       WRITE_TARGETS_SHEET: ${{ inputs.write_targets_sheet }}
       TARGETS_SHEET_NAME: "targets"
 
+      # 出力先シート名
       CLINICS_SHEET_NAME: "clinics"
       MENUS_SHEET_NAME:   "menus"
       HOURS_SHEET_NAME:   "hours"
@@ -45,6 +61,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
 
       - name: Install deps
         run: |
@@ -54,7 +71,9 @@ jobs:
       - name: Run scraper
         run: python scripts/scrape.py
 
+      # キャンセル/失敗でも出力を必ず回収
       - name: Upload artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: scrape-output
