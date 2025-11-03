@@ -1,9 +1,105 @@
+# beauty/scripts/scrape.py
 import os, re, json, base64, time
 from datetime import datetime, timezone
 from urllib.parse import urljoin
 import requests
 from bs4 import BeautifulSoup
 import pandas as pd
+
+# ---- DB ----
+from sqlalchemy import create_engine, text
+
+def get_engine():
+    """
+    SSHトンネルで 127.0.0.1:3307 -> ConoHa MySQL に転送されている前提。
+    GitHub Actions 側のワークフローでトンネルを張ってから実行してください。
+    必要ENV: DB_USER, DB_PASS, DB_NAME
+    """
+    db_user = os.getenv("DB_USER")
+    db_pass = os.getenv("DB_PASS")
+    db_name = os.getenv("DB_NAME")
+    if not all([db_user, db_pass, db_name]):
+        raise RuntimeError("DB_USER / DB_PASS / DB_NAME が未設定です。Secretsまたは環境変数を確認してください。")
+    url = f"mysql+pymysql://{db_user}:{db_pass}@127.0.0.1:3307/{db_name}?charset=utf8mb4"
+    return create_engine(url, echo=False, pool_pre_ping=True)
+
+def ensure_tables():
+    """
+    clinics / menus / hours を必要なスキーマで作成（存在しなければ）。
+    """
+    ddl_clinics = """
+    CREATE TABLE IF NOT EXISTS clinics (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      timestamp_utc DATETIME,
+      clinic_id VARCHAR(50),
+      name TEXT,
+      rank INT,
+      rating FLOAT,
+      reviews_count INT,
+      clinic_url TEXT,
+      source_page_url TEXT,
+      prefecture VARCHAR(50),
+      city VARCHAR(50),
+      station VARCHAR(50),
+      access_text TEXT,
+      snippet TEXT,
+      snippet_author TEXT,
+      images_csv TEXT,
+      features_csv TEXT,
+      hours_json JSON,
+      breadcrumb_json JSON,
+      last_seen_utc DATETIME,
+      status VARCHAR(20),
+      notes TEXT
+    ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+    """
+    ddl_menus = """
+    CREATE TABLE IF NOT EXISTS menus (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      timestamp_utc DATETIME,
+      clinic_id VARCHAR(50),
+      menu_title TEXT,
+      price_jpy INT,
+      price_raw TEXT,
+      menu_url TEXT,
+      pickup_flag BOOLEAN,
+      category_raw TEXT,
+      menu_img TEXT
+    ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+    """
+    ddl_hours = """
+    CREATE TABLE IF NOT EXISTS hours (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      timestamp_utc DATETIME,
+      clinic_id VARCHAR(50),
+      day VARCHAR(20),
+      open_time VARCHAR(10),
+      close_time VARCHAR(10),
+      raw TEXT
+    ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+    """
+    eng = get_engine()
+    with eng.begin() as conn:
+        conn.execute(text(ddl_clinics))
+        conn.execute(text(ddl_menus))
+        conn.execute(text(ddl_hours))
+    print("[DB] ensure_tables: OK")
+
+def write_three_tables(clinics_rows, menus_rows, hours_rows):
+    """
+    pandas.to_sql で一括INSERT。テーブルは ensure_tables() 済み前提。
+    """
+    eng = get_engine()
+    with eng.begin() as conn:
+        if clinics_rows:
+            pd.DataFrame(clinics_rows).to_sql("clinics", conn, if_exists="append", index=False)
+            print(f"[DB] clinics +{len(clinics_rows)}")
+        if menus_rows:
+            pd.DataFrame(menus_rows).to_sql("menus", conn, if_exists="append", index=False)
+            print(f"[DB] menus +{len(menus_rows)}")
+        if hours_rows:
+            pd.DataFrame(hours_rows).to_sql("hours", conn, if_exists="append", index=False)
+            print(f"[DB] hours +{len(hours_rows)}")
 
 # ---- Config ----
 USER_AGENT = "Mozilla/5.0 (compatible; ScraperBot/1.0; +https://github.com/your/repo)"
@@ -301,33 +397,13 @@ def parse_breadcrumbs(soup, page_url):
         "station": station,
     }
 
-# ---- Sheets helpers ----
-def get_gspread_client_from_b64(json_b64: str):
-    import gspread
-    from google.oauth2.service_account import Credentials
-    info = json.loads(base64.b64decode(json_b64).decode("utf-8"))
-    scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive.readonly"]
-    creds = Credentials.from_service_account_info(info, scopes=scopes)
-    return gspread.authorize(creds)
+# ---- IO ----
+def save_csv(df, path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    df.to_csv(path, index=False, encoding="utf-8-sig")
+    print(f"[Saved] {path}")
 
-def ensure_header(ws, header):
-    first = ws.row_values(1)
-    if [h.strip() for h in first] != header:
-        if first:
-            ws.delete_rows(1)
-        ws.insert_row(header, 1)
-
-def append_rows(ws, rows):
-    header = ws.row_values(1)
-    values = [[r.get(k, "") for k in header] for r in rows]
-    if values:
-        ws.append_rows(values, value_input_option="RAW")
-
-# ==== 3シート ====
-CLINICS_SHEET = os.getenv("CLINICS_SHEET_NAME", "clinics")
-MENUS_SHEET   = os.getenv("MENUS_SHEET_NAME", "menus")
-HOURS_SHEET   = os.getenv("HOURS_SHEET_NAME", "hours")
-
+# ==== 3テーブルのカラムヘッダ（CSV保存にも使用） ====
 CLINICS_HEADER = [
     "timestamp_utc","clinic_id","name","rank","rating","reviews_count",
     "clinic_url","source_page_url","prefecture","city","station",
@@ -343,111 +419,20 @@ HOURS_HEADER = [
     "timestamp_utc","clinic_id","day","open_time","close_time","raw"
 ]
 
-def write_three_sheets(clinics_rows, menus_rows, hours_rows):
-    json_b64 = os.getenv("GSHEET_JSON_B64")
-    sheet_key = os.getenv("GSHEET_KEY")
-    if not (json_b64 and sheet_key):
-        print("[Sheets] Skipped (env not set).")
-        return
-    gc = get_gspread_client_from_b64(json_b64)
-    sh = gc.open_by_key(sheet_key)
-
-    try:
-        ws_c = sh.worksheet(CLINICS_SHEET)
-    except Exception:
-        ws_c = sh.add_worksheet(title=CLINICS_SHEET, rows=5000, cols=len(CLINICS_HEADER))
-    ensure_header(ws_c, CLINICS_HEADER); append_rows(ws_c, clinics_rows)
-    print(f"[Sheets] clinics +{len(clinics_rows)}")
-
-    try:
-        ws_m = sh.worksheet(MENUS_SHEET)
-    except Exception:
-        ws_m = sh.add_worksheet(title=MENUS_SHEET, rows=5000, cols=len(MENUS_HEADER))
-    ensure_header(ws_m, MENUS_HEADER); append_rows(ws_m, menus_rows)
-    print(f"[Sheets] menus +{len(menus_rows)}")
-
-    try:
-        ws_h = sh.worksheet(HOURS_SHEET)
-    except Exception:
-        ws_h = sh.add_worksheet(title=HOURS_SHEET, rows=5000, cols=len(HOURS_HEADER))
-    ensure_header(ws_h, HOURS_HEADER); append_rows(ws_h, hours_rows)
-    print(f"[Sheets] hours +{len(hours_rows)}")
-
-# ---- 設定/ターゲット補助 ----
-def write_settings_sheet():
-    if os.getenv("WRITE_SETTINGS_SHEET", "").lower() != "true":
-        return
-    json_b64 = os.getenv("GSHEET_JSON_B64")
-    sheet_key = os.getenv("GSHEET_KEY")
-    settings_sheet_name = os.getenv("SETTINGS_SHEET_NAME", "settings")
-    if not (json_b64 and sheet_key):
-        print("[Settings] Skipped (env not set).")
-        return
-    gc = get_gspread_client_from_b64(json_b64)
-    sh = gc.open_by_key(sheet_key)
-    try:
-        ws = sh.worksheet(settings_sheet_name)
-    except Exception:
-        ws = sh.add_worksheet(title=settings_sheet_name, rows=100, cols=4)
-    header = ["key","value","note","updated_utc"]
-    ensure_header(ws, header)
-
-    def masked_summary(b64: str):
-        s = (b64 or "").strip()
-        if len(s) <= 12: return f"(masked) len={len(s)}"
-        return f"(masked) len={len(s)}, head={s[:6]}..., tail=...{s[-6:]}"
-
-    now = now_utc_iso()
-    rows = [
-        {"key":"END_ID", "value": os.getenv("END_ID",""), "note":"探索の最終ID（0001〜END_ID）", "updated_utc": now},
-        {"key":"CLINICS_SHEET_NAME", "value": CLINICS_SHEET, "note":"クリニック出力", "updated_utc": now},
-        {"key":"MENUS_SHEET_NAME", "value": MENUS_SHEET, "note":"メニュー出力", "updated_utc": now},
-        {"key":"HOURS_SHEET_NAME", "value": HOURS_SHEET, "note":"営業時間出力", "updated_utc": now},
-        {"key":"GSHEET_KEY", "value": sheet_key, "note":"スプレッドシートID", "updated_utc": now},
-        {"key":"GSHEET_JSON_B64", "value": masked_summary(json_b64), "note":"Secrets。値は保存しない。", "updated_utc": now},
-        {"key":"MENU_IMG_FOLLOW", "value": os.getenv("MENU_IMG_FOLLOW","true"), "note":"詳細ページまで追跡して画像取得", "updated_utc": now},
-    ]
-    append_rows(ws, rows)
-    print(f"[Settings] wrote {len(rows)} rows")
-
-def write_targets_sheet(urls):
-    if os.getenv("WRITE_TARGETS_SHEET", "").lower() != "true":
-        return
-    json_b64 = os.getenv("GSHEET_JSON_B64")
-    sheet_key = os.getenv("GSHEET_KEY")
-    if not (json_b64 and sheet_key):
-        print("[targets sheet] Skipped (env not set).")
-        return
-    gc = get_gspread_client_from_b64(json_b64)
-    sh = gc.open_by_key(sheet_key)
-    title = os.getenv("TARGETS_SHEET_NAME", "targets")
-    try:
-        ws = sh.worksheet(title)
-    except Exception:
-        ws = sh.add_worksheet(title=title, rows=2000, cols=3)
-    header = ["timestamp_utc", "url", "clinic_id"]
-    ensure_header(ws, header)
-    ts = now_utc_iso()
-    rows = [{"timestamp_utc": ts, "url": u, "clinic_id": get_clinic_id_from_url(u)} for u in urls]
-    append_rows(ws, rows)
-    print(f"[targets sheet] +{len(rows)} rows -> {title}")
-
-# ---- IO ----
-def save_csv(df, path):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    df.to_csv(path, index=False, encoding="utf-8-sig")
-    print(f"[Saved] {path}")
-
 # ---- main ----
 def main():
+    # 1) URL解決
     urls = load_urls_from_env()
     if not urls:
         urls = build_target_urls_auto()
     if not urls:
         raise SystemExit("No valid clinic pages found")
 
+    # 2) DBテーブル保証
+    ensure_tables()
+
+    # 3) スクレイプ
     out_dir = os.getenv("OUTPUT_DIR", "output"); os.makedirs(out_dir, exist_ok=True)
-    write_targets_sheet(urls)
 
     ts = now_utc_iso()
     clinics_rows, menus_rows, hours_rows = [], [], []
@@ -553,7 +538,7 @@ def main():
 
         time.sleep(SLEEP_BETWEEN)
 
-    # 保存
+    # 4) CSVも保存（デバッグ/バックアップ用途）
     df_clinics = pd.DataFrame(clinics_rows, columns=CLINICS_HEADER)
     df_menus   = pd.DataFrame(menus_rows,   columns=MENUS_HEADER)
     df_hours   = pd.DataFrame(hours_rows,   columns=HOURS_HEADER)
@@ -566,9 +551,8 @@ def main():
         json.dump(all_cards, f, ensure_ascii=False, indent=2)
     print("[Saved] output/cards.json")
 
-    # Sheets
-    write_three_sheets(clinics_rows, menus_rows, hours_rows)
-    write_settings_sheet()
+    # 5) DB書き込み
+    write_three_tables(clinics_rows, menus_rows, hours_rows)
 
 if __name__ == "__main__":
     main()
