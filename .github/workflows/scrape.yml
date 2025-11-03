@@ -1,4 +1,4 @@
-name: Scrape
+name: Scrape to MySQL (via SSH)
 
 on:
   workflow_dispatch:
@@ -15,16 +15,7 @@ on:
         description: "End clinic ID (e.g. 9999). Ignored if target_urls is set."
         required: false
         default: "9999"
-      write_settings:
-        description: "Write settings sheet? (true/false)"
-        required: false
-        default: "true"
-      write_targets_sheet:
-        description: "Write 'targets' sheet? (true/false)"
-        required: false
-        default: "true"
 
-# 連打で前Runを潰さない
 concurrency:
   group: scrape-${{ github.ref }}
   cancel-in-progress: false
@@ -35,34 +26,25 @@ jobs:
     timeout-minutes: 360
 
     env:
-      # 既定の自動探索は 1〜END_ID（inputs が空のときに使用）
       START_ID: ${{ inputs.start_id }}
-      END_ID:   ${{ inputs.end_id }}
+      END_ID: ${{ inputs.end_id }}
+      TARGET_URLS: ${{ inputs.target_urls }}
       OUTPUT_DIR: "output"
 
-      # Google Sheets（Secrets）
-      GSHEET_JSON_B64: ${{ secrets.GSHEET_JSON_B64 }}
-      GSHEET_KEY: ${{ secrets.GSHEET_KEY }}
+      # DB接続情報（Secretsで設定済み）
+      DB_USER: ${{ secrets.DB_USER }}
+      DB_PASS: ${{ secrets.DB_PASS }}
+      DB_NAME: ${{ secrets.DB_NAME }}
 
-      # 手動URL（優先）
-      TARGET_URLS: ${{ inputs.target_urls }}
-
-      # 設定/URL記録
-      WRITE_SETTINGS_SHEET: ${{ inputs.write_settings }}
-      SETTINGS_SHEET_NAME: "settings"
-      WRITE_TARGETS_SHEET: ${{ inputs.write_targets_sheet }}
-      TARGETS_SHEET_NAME: "targets"
-
-      # 出力シート名
-      CLINICS_SHEET_NAME: "clinics"
-      MENUS_SHEET_NAME:   "menus"
-      HOURS_SHEET_NAME:   "hours"
+      # SSH情報（Secretsで設定済み）
+      SSH_HOST: ${{ secrets.SSH_HOST }}
+      SSH_PORT: ${{ secrets.SSH_PORT }}
+      SSH_USER: ${{ secrets.SSH_USER }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 何があっても最低限のartifactを残すための準備
       - name: Prepare output folder
         run: |
           mkdir -p output
@@ -76,20 +58,37 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests beautifulsoup4 pandas google-auth gspread
+          pip install requests beautifulsoup4 pandas sqlalchemy pymysql
 
-      # 参考用: このRunで何をターゲットにするかをファイルに残す
+      # ===== SSHトンネル作成 =====
+      - name: Setup SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -p ${{ secrets.SSH_PORT }} -H ${{ secrets.SSH_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Create SSH tunnel
+        run: |
+          echo "Opening SSH tunnel to ${{ secrets.SSH_HOST }}:${{ secrets.SSH_PORT }} ..."
+          nohup ssh -i ~/.ssh/id_rsa \
+            -p ${{ secrets.SSH_PORT }} \
+            -o ServerAliveInterval=60 \
+            -o ExitOnForwardFailure=yes \
+            -N -L 3307:127.0.0.1:3306 \
+            ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} > tunnel.log 2>&1 &
+          sleep 5
+          echo "✅ SSH tunnel established (port 3307)"
+
       - name: Show targets and save plan
-        shell: bash
         run: |
           set -e
           mkdir -p output
           if [ -n "${TARGET_URLS// }" ]; then
             echo "Using TARGET_URLS input"
-            # 正規化して targets.txt に保存
             echo "${TARGET_URLS}" | tr ',\r' '\n' | sed 's/^[ \t]*//;s/[ \t]*$//' | grep -E '^https?://' | sort -u > output/targets.txt
           else
             echo "Using START_ID..END_ID"
@@ -104,11 +103,9 @@ jobs:
           head -n 20 output/targets.txt || true
           wc -l output/targets.txt || true
 
-      - name: Run scraper
-        # スクリプト側は TARGET_URLS が空なら START_ID〜END_ID を見て自動生成する実装にしておく
-        run: python scripts/scrape.py
+      - name: Run scraper (MySQL mode)
+        run: python beauty/scripts/scrape.py
 
-      # キャンセル/失敗でも成果物回収
       - name: Upload artifact
         if: always()
         uses: actions/upload-artifact@v4
@@ -119,3 +116,7 @@ jobs:
             output/*.json
             output/*.txt
           if-no-files-found: warn
+
+      - name: Show SSH logs
+        if: always()
+        run: cat tunnel.log || true
