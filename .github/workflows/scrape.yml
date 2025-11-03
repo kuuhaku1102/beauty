@@ -16,6 +16,7 @@ on:
         required: false
         default: "9999"
 
+# 複数Runが衝突しないように
 concurrency:
   group: scrape-${{ github.ref }}
   cancel-in-progress: false
@@ -26,23 +27,24 @@ jobs:
     timeout-minutes: 360
 
     env:
+      # 環境変数（inputs）
       START_ID: ${{ inputs.start_id }}
       END_ID: ${{ inputs.end_id }}
       TARGET_URLS: ${{ inputs.target_urls }}
       OUTPUT_DIR: "output"
 
-      # DB接続情報（Secretsで設定済み）
+      # MySQL接続情報（Secrets）
       DB_USER: ${{ secrets.DB_USER }}
       DB_PASS: ${{ secrets.DB_PASS }}
       DB_NAME: ${{ secrets.DB_NAME }}
 
-      # SSH情報（Secretsで設定済み）
+      # SSH接続情報（Secrets）
       SSH_HOST: ${{ secrets.SSH_HOST }}
       SSH_PORT: ${{ secrets.SSH_PORT }}
       SSH_USER: ${{ secrets.SSH_USER }}
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Prepare output folder
@@ -83,6 +85,7 @@ jobs:
           sleep 5
           echo "✅ SSH tunnel established (port 3307)"
 
+      # ===== URL計画確認 =====
       - name: Show targets and save plan
         run: |
           set -e
@@ -103,9 +106,12 @@ jobs:
           head -n 20 output/targets.txt || true
           wc -l output/targets.txt || true
 
+      # ===== メインスクレイパー実行 =====
       - name: Run scraper (MySQL mode)
-        run: python beauty/scripts/scrape.py
+        working-directory: beauty
+        run: python scripts/scrape.py
 
+      # ===== 成果物アップロード =====
       - name: Upload artifact
         if: always()
         uses: actions/upload-artifact@v4
@@ -117,6 +123,7 @@ jobs:
             output/*.txt
           if-no-files-found: warn
 
+      # ===== SSHログ確認 =====
       - name: Show SSH logs
         if: always()
         run: cat tunnel.log || true
