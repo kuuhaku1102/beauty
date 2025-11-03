@@ -1,0 +1,41 @@
+name: DB Connection Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-db:
+    runs-on: ubuntu-latest
+
+    env:
+      DB_TYPE: ${{ secrets.DB_TYPE }}
+      DB_HOST: ${{ secrets.DB_HOST }}
+      DB_PORT: ${{ secrets.DB_PORT }}
+      DB_USER: ${{ secrets.DB_USER }}
+      DB_PASS: ${{ secrets.DB_PASS }}
+      DB_NAME: ${{ secrets.DB_NAME }}
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: 3.11
+
+      - name: Install dependencies
+        run: pip install sqlalchemy pymysql
+
+      - name: Run DB connection test
+        run: |
+          python - <<'PYCODE'
+          from sqlalchemy import create_engine, text
+          import os
+          url = f"mysql+pymysql://{os.environ['DB_USER']}:{os.environ['DB_PASS']}@{os.environ['DB_HOST']}:{os.environ['DB_PORT']}/{os.environ['DB_NAME']}?charset=utf8mb4"
+          print("Connecting to:", url.replace(os.environ['DB_PASS'], "********"))
+          engine = create_engine(url, echo=False)
+          with engine.connect() as conn:
+              res = conn.execute(text("SELECT NOW();"))
+              print("✅ Connected successfully:", res.scalar())
+          PYCODE
