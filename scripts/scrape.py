@@ -7,12 +7,14 @@ import pandas as pd
 from sqlalchemy import create_engine, text
 
 # ==========================================================
-#  DB接続設定（SSHトンネル前提）
+#  DB接続設定（Secrets経由）
 # ==========================================================
 def get_engine():
     """
-    SSHトンネル経由でMySQLへ接続（安全＆安定版）
+    GitHub ActionsからSecrets経由でMySQL接続
     """
+    db_host = os.getenv("DB_HOST", "127.0.0.1")
+    db_port = os.getenv("DB_PORT", "3306")
     db_user = os.getenv("DB_USER")
     db_pass = os.getenv("DB_PASS")
     db_name = os.getenv("DB_NAME")
@@ -20,15 +22,10 @@ def get_engine():
     if not all([db_user, db_pass, db_name]):
         raise RuntimeError("❌ DB_USER / DB_PASS / DB_NAME が未設定です。")
 
-    # URLエンコードして特殊文字にも対応
     db_user_enc = quote_plus(db_user)
     db_pass_enc = quote_plus(db_pass)
-    host = "127.0.0.1"
-    port = 3307  # SSHトンネル転送先
+    url = f"mysql+pymysql://{db_user_enc}:{db_pass_enc}@{db_host}:{db_port}/{db_name}?charset=utf8mb4"
 
-    url = f"mysql+pymysql://{db_user_enc}:{db_pass_enc}@{host}:{port}/{db_name}?charset=utf8mb4"
-
-    # ✅ 接続安定化設定
     connect_args = {
         "connect_timeout": 20,
         "read_timeout": 60,
@@ -39,8 +36,8 @@ def get_engine():
     engine = create_engine(
         url,
         echo=False,
-        pool_pre_ping=True,  # 接続確認
-        pool_recycle=280,    # 再利用時間
+        pool_pre_ping=True,
+        pool_recycle=280,
         connect_args=connect_args
     )
     return engine
@@ -48,7 +45,7 @@ def get_engine():
 
 def ensure_tables():
     """
-    clinics / menus / hours テーブルを自動生成
+    clinics / menus / hours テーブルを自動作成
     """
     ddl_clinics = """
     CREATE TABLE IF NOT EXISTS clinics (
@@ -152,9 +149,6 @@ def get_clinic_id_from_url(u: str):
     return m.group(1) if m else ""
 
 def load_urls_from_env():
-    """
-    環境変数 TARGET_URLS があれば利用。なければ自動探索。
-    """
     raw = os.getenv("TARGET_URLS", "") or ""
     flat = re.sub(r"[\s,]+", " ", raw.strip())
     found = re.findall(r"https?://.*?(?=https?://|\s|$)", flat)
@@ -189,10 +183,7 @@ def check_url_exists(url):
         return False
 
 def build_target_urls_auto():
-    """
-    START_ID〜END_ID まで自動生成
-    """
-    end_id_str = os.getenv("END_ID", "9999")
+    end_id_str = os.getenv("END_ID", "100")
     if not end_id_str.isdigit():
         raise SystemExit("END_ID must be numeric")
     end_id = int(end_id_str)
@@ -208,64 +199,11 @@ def build_target_urls_auto():
         time.sleep(0.05)
     return valid_urls
 
+# ==========================================================
+#  ページ解析
+# ==========================================================
 TIME_RANGE_RE = re.compile(r"(?P<open>\d{1,2}:\d{2}).*?(?P<close>\d{1,2}:\d{2})")
 WEEK_DAYS = ["月", "火", "水", "木", "金", "土", "日"]
-
-def parse_hours_table(table):
-    hours = {}
-    if not table:
-        return hours
-    for tr in table.select("tbody > tr") or table.find_all("tr"):
-        tds = tr.find_all("td")
-        if len(tds) < 2:
-            continue
-        day = clean_text(tds[0].get_text())
-        time_text = clean_text(tds[1].get_text(" "))
-        if day and any(w in day for w in WEEK_DAYS):
-            hours[day] = time_text
-    return hours
-
-def split_open_close(raw):
-    if not raw:
-        return "", ""
-    m = TIME_RANGE_RE.search(raw)
-    if not m:
-        return "", ""
-    return m.group("open"), m.group("close")
-
-def to_abs_url(maybe_url: str, page_url: str) -> str:
-    if not maybe_url:
-        return ""
-    if maybe_url.startswith("http://") or maybe_url.startswith("https://"):
-        return maybe_url
-    if maybe_url.startswith("//"):
-        return "https:" + maybe_url
-    return urljoin(page_url, maybe_url)
-
-def extract_menus_from_scope(scope, base_url=None):
-    menus = []
-    for a in scope.select("a.small-list__item"):
-        title = clean_text(a.select_one(".small-list__title") and a.select_one(".small-list__title").get_text())
-        price_text = clean_text(a.select_one(".small-list__price") and a.select_one(".small-list__price").get_text())
-        price_jpy = None
-        m = re.search(r"¥\s*([\d,]+)", price_text or "")
-        if m:
-            try:
-                price_jpy = int(m.group(1).replace(",", ""))
-            except:
-                pass
-        href = a.get("href") or ""
-        menu_url = urljoin(base_url, href) if base_url else href
-        menus.append({
-            "title": title,
-            "price_jpy": price_jpy,
-            "price_raw": price_text,
-            "url": menu_url,
-            "pickup_flag": bool(a.select_one(".pickup-label_active")),
-            "category_raw": "",
-            "menu_img": ""
-        })
-    return menus
 
 def parse_card(card, base_url=None):
     a_title = card.select_one("a.card__title")
@@ -275,14 +213,11 @@ def parse_card(card, base_url=None):
     rating = float(rating_el.get_text().strip()) if rating_el else None
     reviews_el = card.select_one("a.report-count")
     reviews = to_int(reviews_el.get_text()) if reviews_el else None
-    menus = extract_menus_from_scope(card, base_url)
     return {
         "name": name,
         "clinic_url": clinic_url,
         "rating": rating,
-        "reviews": reviews,
-        "menus": menus,
-        "hours": {}
+        "reviews": reviews
     }
 
 def parse_page(html, page_url):
@@ -290,9 +225,8 @@ def parse_page(html, page_url):
     cards = [parse_card(c, base_url=page_url) for c in soup.select(".card.clinic-list__card")]
     if not cards:
         h1 = clean_text(soup.select_one("h1") and soup.select_one("h1").get_text())
-        cards.append({"name": h1, "clinic_url": page_url, "rating": None, "reviews": None, "menus": [], "hours": {}})
-    return cards, soup
-
+        cards.append({"name": h1, "clinic_url": page_url, "rating": None, "reviews": None})
+    return cards
 
 # ==========================================================
 #  メイン処理
@@ -302,16 +236,14 @@ def main():
     if not urls:
         raise SystemExit("No valid clinic pages found")
 
-    # --- DB準備 ---
     ensure_tables()
-
     ts = now_utc_iso()
-    clinics_rows, menus_rows, hours_rows = [], [], []
+    clinics_rows = []
 
     for source_page_url in urls:
         print(f"[Fetch] {source_page_url}")
         html = fetch(source_page_url)
-        cards, _ = parse_page(html, source_page_url)
+        cards = parse_page(html, source_page_url)
 
         for c in cards:
             clinic_id = get_clinic_id_from_url(c.get("clinic_url"))
@@ -338,21 +270,8 @@ def main():
                 "status": "ok",
                 "notes": ""
             })
-            for m in c.get("menus", []):
-                menus_rows.append({
-                    "timestamp_utc": ts,
-                    "clinic_id": clinic_id,
-                    "menu_title": m.get("title",""),
-                    "price_jpy": m.get("price_jpy"),
-                    "price_raw": m.get("price_raw",""),
-                    "menu_url": m.get("url",""),
-                    "pickup_flag": m.get("pickup_flag"),
-                    "category_raw": m.get("category_raw",""),
-                    "menu_img": m.get("menu_img",""),
-                })
 
-    # --- DB保存 ---
-    write_three_tables(clinics_rows, menus_rows, hours_rows)
+    write_three_tables(clinics_rows, [], [])
     print("[DONE] Scraping complete ✅")
 
 
