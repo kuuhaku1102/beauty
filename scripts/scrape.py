@@ -1,131 +1,12 @@
 import os, re, json, time
 from datetime import datetime, timezone
-from urllib.parse import urljoin, quote_plus
+from urllib.parse import urljoin
 import requests
 from bs4 import BeautifulSoup
 import pandas as pd
-from sqlalchemy import create_engine, text
 
 # ==========================================================
-#  DB接続設定（Secrets経由）
-# ==========================================================
-def get_engine():
-    """
-    GitHub ActionsからSecrets経由でMySQL接続
-    """
-    db_host = os.getenv("DB_HOST", "127.0.0.1")
-    db_port = os.getenv("DB_PORT", "3306")
-    db_user = os.getenv("DB_USER")
-    db_pass = os.getenv("DB_PASS")
-    db_name = os.getenv("DB_NAME")
-
-    if not all([db_user, db_pass, db_name]):
-        raise RuntimeError("❌ DB_USER / DB_PASS / DB_NAME が未設定です。")
-
-    db_user_enc = quote_plus(db_user)
-    db_pass_enc = quote_plus(db_pass)
-    url = f"mysql+pymysql://{db_user_enc}:{db_pass_enc}@{db_host}:{db_port}/{db_name}?charset=utf8mb4"
-
-    connect_args = {
-        "connect_timeout": 20,
-        "read_timeout": 60,
-        "write_timeout": 60,
-        "autocommit": True
-    }
-
-    engine = create_engine(
-        url,
-        echo=False,
-        pool_pre_ping=True,
-        pool_recycle=280,
-        connect_args=connect_args
-    )
-    return engine
-
-
-def ensure_tables():
-    """
-    clinics / menus / hours テーブルを自動作成
-    """
-    ddl_clinics = """
-    CREATE TABLE IF NOT EXISTS clinics (
-      id INT AUTO_INCREMENT PRIMARY KEY,
-      timestamp_utc DATETIME,
-      clinic_id VARCHAR(50),
-      name TEXT,
-      rank INT,
-      rating FLOAT,
-      reviews_count INT,
-      clinic_url TEXT,
-      source_page_url TEXT,
-      prefecture VARCHAR(50),
-      city VARCHAR(50),
-      station VARCHAR(50),
-      access_text TEXT,
-      snippet TEXT,
-      snippet_author TEXT,
-      images_csv TEXT,
-      features_csv TEXT,
-      hours_json JSON,
-      breadcrumb_json JSON,
-      last_seen_utc DATETIME,
-      status VARCHAR(20),
-      notes TEXT
-    ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-    """
-    ddl_menus = """
-    CREATE TABLE IF NOT EXISTS menus (
-      id INT AUTO_INCREMENT PRIMARY KEY,
-      timestamp_utc DATETIME,
-      clinic_id VARCHAR(50),
-      menu_title TEXT,
-      price_jpy INT,
-      price_raw TEXT,
-      menu_url TEXT,
-      pickup_flag BOOLEAN,
-      category_raw TEXT,
-      menu_img TEXT
-    ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-    """
-    ddl_hours = """
-    CREATE TABLE IF NOT EXISTS hours (
-      id INT AUTO_INCREMENT PRIMARY KEY,
-      timestamp_utc DATETIME,
-      clinic_id VARCHAR(50),
-      day VARCHAR(20),
-      open_time VARCHAR(10),
-      close_time VARCHAR(10),
-      raw TEXT
-    ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-    """
-
-    eng = get_engine()
-    with eng.begin() as conn:
-        conn.execute(text(ddl_clinics))
-        conn.execute(text(ddl_menus))
-        conn.execute(text(ddl_hours))
-    print("[DB] ensure_tables: OK")
-
-
-def write_three_tables(clinics_rows, menus_rows, hours_rows):
-    """
-    pandas.to_sql で clinics / menus / hours を一括INSERT
-    """
-    eng = get_engine()
-    with eng.begin() as conn:
-        if clinics_rows:
-            pd.DataFrame(clinics_rows).to_sql("clinics", conn, if_exists="append", index=False)
-            print(f"[DB] clinics +{len(clinics_rows)}")
-        if menus_rows:
-            pd.DataFrame(menus_rows).to_sql("menus", conn, if_exists="append", index=False)
-            print(f"[DB] menus +{len(menus_rows)}")
-        if hours_rows:
-            pd.DataFrame(hours_rows).to_sql("hours", conn, if_exists="append", index=False)
-            print(f"[DB] hours +{len(hours_rows)}")
-
-
-# ==========================================================
-#  スクレイピング設定
+# 設定
 # ==========================================================
 USER_AGENT = "Mozilla/5.0 (compatible; ScraperBot/1.0; +https://github.com/your/repo)"
 TIMEOUT = 30
@@ -148,30 +29,9 @@ def get_clinic_id_from_url(u: str):
     m = re.search(r"/clinics/(\d+)", u or "")
     return m.group(1) if m else ""
 
-def load_urls_from_env():
-    raw = os.getenv("TARGET_URLS", "") or ""
-    flat = re.sub(r"[\s,]+", " ", raw.strip())
-    found = re.findall(r"https?://.*?(?=https?://|\s|$)", flat)
-    uniq, seen = [], set()
-    for u in found:
-        u = u.strip()
-        if u and u not in seen:
-            uniq.append(u)
-            seen.add(u)
-    return uniq
-
-def fetch(url):
-    last_exc = None
-    for i in range(RETRY):
-        try:
-            r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT)
-            r.raise_for_status()
-            return r.text
-        except Exception as e:
-            last_exc = e
-            time.sleep(SLEEP_BETWEEN * (i + 1))
-    raise last_exc
-
+# ==========================================================
+# URL自動探索
+# ==========================================================
 def check_url_exists(url):
     try:
         r = requests.head(url, headers={"User-Agent": USER_AGENT}, timeout=5, allow_redirects=True)
@@ -200,10 +60,19 @@ def build_target_urls_auto():
     return valid_urls
 
 # ==========================================================
-#  ページ解析
+# HTML解析
 # ==========================================================
-TIME_RANGE_RE = re.compile(r"(?P<open>\d{1,2}:\d{2}).*?(?P<close>\d{1,2}:\d{2})")
-WEEK_DAYS = ["月", "火", "水", "木", "金", "土", "日"]
+def fetch(url):
+    last_exc = None
+    for i in range(RETRY):
+        try:
+            r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT)
+            r.raise_for_status()
+            return r.text
+        except Exception as e:
+            last_exc = e
+            time.sleep(SLEEP_BETWEEN * (i + 1))
+    raise last_exc
 
 def parse_card(card, base_url=None):
     a_title = card.select_one("a.card__title")
@@ -229,60 +98,33 @@ def parse_page(html, page_url):
     return cards
 
 # ==========================================================
-#  メイン処理
+# main
 # ==========================================================
 def main():
-    urls = load_urls_from_env() or build_target_urls_auto()
-    if not urls:
-        raise SystemExit("No valid clinic pages found")
-
-    ensure_tables()
+    urls = build_target_urls_auto()
     ts = now_utc_iso()
-    clinics_rows = []
+    clinics = []
 
-    for source_page_url in urls:
-        print(f"[Fetch] {source_page_url}")
-        html = fetch(source_page_url)
-        cards = parse_page(html, source_page_url)
-
+    for url in urls:
+        print(f"[Fetch] {url}")
+        html = fetch(url)
+        cards = parse_page(html, url)
         for c in cards:
-            clinic_id = get_clinic_id_from_url(c.get("clinic_url"))
-            clinics_rows.append({
+            clinics.append({
                 "timestamp_utc": ts,
-                "clinic_id": clinic_id,
-                "name": c.get("name",""),
-                "rank": None,
+                "clinic_id": get_clinic_id_from_url(c.get("clinic_url")),
+                "name": c.get("name", ""),
                 "rating": c.get("rating"),
-                "reviews_count": c.get("reviews"),
-                "clinic_url": c.get("clinic_url"),
-                "source_page_url": source_page_url,
-                "prefecture": "",
-                "city": "",
-                "station": "",
-                "access_text": "",
-                "snippet": "",
-                "snippet_author": "",
-                "images_csv": "",
-                "features_csv": "",
-                "hours_json": "{}",
-                "breadcrumb_json": "[]",
-                "last_seen_utc": ts,
-                "status": "ok",
-                "notes": ""
+                "reviews": c.get("reviews"),
+                "clinic_url": c.get("clinic_url")
             })
+        time.sleep(1)
 
-    write_three_tables(clinics_rows, [], [])
+    os.makedirs("output", exist_ok=True)
+    df = pd.DataFrame(clinics)
+    df.to_csv("output/clinics.csv", index=False, encoding="utf-8-sig")
+    print(f"[Saved] output/clinics.csv ({len(df)} rows)")
     print("[DONE] Scraping complete ✅")
 
-
 if __name__ == "__main__":
-    print("[DB] Testing connection...")
-    try:
-        eng = get_engine()
-        with eng.connect() as conn:
-            res = conn.execute(text("SELECT NOW()")).scalar()
-            print(f"[DB] Connected successfully: {res}")
-    except Exception as e:
-        print("❌ Connection test failed:", e)
-        raise
     main()
