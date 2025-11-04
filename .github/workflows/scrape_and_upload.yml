@@ -27,6 +27,13 @@ jobs:
       END_ID: ${{ inputs.end_id }}
       OUTPUT_DIR: "output"
 
+      # ✅ DB接続情報（Secretsから）
+      DB_HOST: ${{ secrets.DB_HOST }}
+      DB_PORT: ${{ secrets.DB_PORT }}
+      DB_USER: ${{ secrets.DB_USER }}
+      DB_PASS: ${{ secrets.DB_PASS }}
+      DB_NAME: ${{ secrets.DB_NAME }}
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -63,6 +70,3 @@ jobs:
           remote_path: /home/c3659606/public_html/beauty/data/
           sftp_only: true
           delete_remote_files: false
-          exclude: |
-            .git/
-            .github/
