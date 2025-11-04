@@ -1,4 +1,4 @@
-import os, re, json, base64, time
+import os, re, json, time
 from datetime import datetime, timezone
 from urllib.parse import urljoin, quote_plus
 import requests
@@ -11,28 +11,44 @@ from sqlalchemy import create_engine, text
 # ==========================================================
 def get_engine():
     """
-    SSHトンネル経由でMySQLへ接続（安全版：URLエンコード対応）
+    SSHトンネル経由でMySQLへ接続（安全＆安定版）
     """
     db_user = os.getenv("DB_USER")
     db_pass = os.getenv("DB_PASS")
     db_name = os.getenv("DB_NAME")
 
     if not all([db_user, db_pass, db_name]):
-        raise RuntimeError("❌ DB_USER / DB_PASS / DB_NAME が未設定です。Secretsまたは環境変数を確認してください。")
+        raise RuntimeError("❌ DB_USER / DB_PASS / DB_NAME が未設定です。")
 
-    # URLエンコードして安全に接続
+    # URLエンコードして特殊文字にも対応
     db_user_enc = quote_plus(db_user)
     db_pass_enc = quote_plus(db_pass)
     host = "127.0.0.1"
-    port = 3307  # SSHトンネルでフォワード済み
+    port = 3307  # SSHトンネル転送先
 
     url = f"mysql+pymysql://{db_user_enc}:{db_pass_enc}@{host}:{port}/{db_name}?charset=utf8mb4"
-    return create_engine(url, echo=False, pool_pre_ping=True)
+
+    # ✅ 接続安定化設定
+    connect_args = {
+        "connect_timeout": 20,
+        "read_timeout": 60,
+        "write_timeout": 60,
+        "autocommit": True
+    }
+
+    engine = create_engine(
+        url,
+        echo=False,
+        pool_pre_ping=True,  # 接続確認
+        pool_recycle=280,    # 再利用時間
+        connect_args=connect_args
+    )
+    return engine
 
 
 def ensure_tables():
     """
-    clinics / menus / hours テーブルを自動作成
+    clinics / menus / hours テーブルを自動生成
     """
     ddl_clinics = """
     CREATE TABLE IF NOT EXISTS clinics (
@@ -96,7 +112,7 @@ def ensure_tables():
 
 def write_three_tables(clinics_rows, menus_rows, hours_rows):
     """
-    pandas.to_sql で3テーブルに一括INSERT
+    pandas.to_sql で clinics / menus / hours を一括INSERT
     """
     eng = get_engine()
     with eng.begin() as conn:
@@ -112,7 +128,7 @@ def write_three_tables(clinics_rows, menus_rows, hours_rows):
 
 
 # ==========================================================
-#  スクレイピングロジック
+#  スクレイピング設定
 # ==========================================================
 USER_AGENT = "Mozilla/5.0 (compatible; ScraperBot/1.0; +https://github.com/your/repo)"
 TIMEOUT = 30
@@ -136,6 +152,9 @@ def get_clinic_id_from_url(u: str):
     return m.group(1) if m else ""
 
 def load_urls_from_env():
+    """
+    環境変数 TARGET_URLS があれば利用。なければ自動探索。
+    """
     raw = os.getenv("TARGET_URLS", "") or ""
     flat = re.sub(r"[\s,]+", " ", raw.strip())
     found = re.findall(r"https?://.*?(?=https?://|\s|$)", flat)
@@ -170,6 +189,9 @@ def check_url_exists(url):
         return False
 
 def build_target_urls_auto():
+    """
+    START_ID〜END_ID まで自動生成
+    """
     end_id_str = os.getenv("END_ID", "9999")
     if not end_id_str.isdigit():
         raise SystemExit("END_ID must be numeric")
@@ -210,18 +232,6 @@ def split_open_close(raw):
     if not m:
         return "", ""
     return m.group("open"), m.group("close")
-
-def pick_img_src(img_tag):
-    if not img_tag:
-        return ""
-    src = (img_tag.get("src") or "").strip()
-    if src:
-        return src
-    srcset = (img_tag.get("srcset") or "").strip()
-    if srcset:
-        first = srcset.split(",")[0].strip().split(" ")[0]
-        return first
-    return ""
 
 def to_abs_url(maybe_url: str, page_url: str) -> str:
     if not maybe_url:
@@ -283,14 +293,16 @@ def parse_page(html, page_url):
         cards.append({"name": h1, "clinic_url": page_url, "rating": None, "reviews": None, "menus": [], "hours": {}})
     return cards, soup
 
+
 # ==========================================================
-#  メイン
+#  メイン処理
 # ==========================================================
 def main():
     urls = load_urls_from_env() or build_target_urls_auto()
     if not urls:
         raise SystemExit("No valid clinic pages found")
 
+    # --- DB準備 ---
     ensure_tables()
 
     ts = now_utc_iso()
@@ -339,9 +351,19 @@ def main():
                     "menu_img": m.get("menu_img",""),
                 })
 
-    # --- 保存 ---
+    # --- DB保存 ---
     write_three_tables(clinics_rows, menus_rows, hours_rows)
     print("[DONE] Scraping complete ✅")
 
+
 if __name__ == "__main__":
+    print("[DB] Testing connection...")
+    try:
+        eng = get_engine()
+        with eng.connect() as conn:
+            res = conn.execute(text("SELECT NOW()")).scalar()
+            print(f"[DB] Connected successfully: {res}")
+    except Exception as e:
+        print("❌ Connection test failed:", e)
+        raise
     main()
