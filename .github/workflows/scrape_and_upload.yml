@@ -1,0 +1,68 @@
+name: Scrape and Upload to ConoHa
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_urls:
+        description: "Comma-separated URLs (optional)"
+        required: false
+        default: |
+      start_id:
+        description: "Start clinic ID"
+        required: false
+        default: "1"
+      end_id:
+        description: "End clinic ID"
+        required: false
+        default: "100"
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    env:
+      TARGET_URLS: ${{ inputs.target_urls }}
+      START_ID: ${{ inputs.start_id }}
+      END_ID: ${{ inputs.end_id }}
+      OUTPUT_DIR: "output"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests beautifulsoup4 pandas sqlalchemy pymysql
+
+      - name: Run scraper
+        run: python scripts/scrape.py
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scrape-output
+          path: output/
+
+      - name: Deploy results to ConoHa via SFTP
+        if: always()
+        uses: wlixcc/SFTP-Deploy-Action@v1.2.6
+        with:
+          server: ${{ secrets.SFTP_SERVER }}
+          port: ${{ secrets.SFTP_PORT }}
+          username: ${{ secrets.SFTP_USERNAME }}
+          ssh_private_key: ${{ secrets.SFTP_PRIVATE_KEY }}
+          local_path: ./output/*
+          remote_path: /home/c3659606/public_html/beauty/data/
+          sftp_only: true
+          delete_remote_files: false
+          exclude: |
+            .git/
+            .github/
