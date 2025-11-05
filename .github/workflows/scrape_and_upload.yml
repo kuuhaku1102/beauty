@@ -15,6 +15,14 @@ on:
         description: "End clinic ID"
         required: false
         default: "100"
+      write_settings_sheet:
+        description: "Write settings sheet? (true/false)"
+        required: false
+        default: "true"
+      write_targets_sheet:
+        description: "Write targets sheet? (true/false)"
+        required: false
+        default: "true"
 
 jobs:
   scrape:
@@ -25,14 +33,15 @@ jobs:
       TARGET_URLS: ${{ inputs.target_urls }}
       START_ID: ${{ inputs.start_id }}
       END_ID: ${{ inputs.end_id }}
+      WRITE_SETTINGS_SHEET: ${{ inputs.write_settings_sheet }}
+      WRITE_TARGETS_SHEET: ${{ inputs.write_targets_sheet }}
       OUTPUT_DIR: "output"
 
-      # ✅ DB接続情報（Secretsから）
-      DB_HOST: ${{ secrets.DB_HOST }}
-      DB_PORT: ${{ secrets.DB_PORT }}
-      DB_USER: ${{ secrets.DB_USER }}
-      DB_PASS: ${{ secrets.DB_PASS }}
-      DB_NAME: ${{ secrets.DB_NAME }}
+      GSHEET_JSON_B64: ${{ secrets.GSHEET_JSON_B64 }}
+      GSHEET_KEY: ${{ secrets.GSHEET_KEY }}
+      CLINICS_SHEET_NAME: "clinics"
+      MENUS_SHEET_NAME: "menus"
+      HOURS_SHEET_NAME: "hours"
 
     steps:
       - name: Checkout repository
@@ -46,7 +55,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests beautifulsoup4 pandas sqlalchemy pymysql
+          pip install -r requirements.txt
 
       - name: Run scraper
         run: python scripts/scrape.py
