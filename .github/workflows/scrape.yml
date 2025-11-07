@@ -1,4 +1,4 @@
-name: Scrape to Google Sheets
+name: Scrape
 
 on:
   workflow_dispatch:
@@ -12,18 +12,19 @@ on:
         required: false
         default: "1"
       end_id:
-        description: "End clinic ID (e.g. 100). Ignored if target_urls is set."
+        description: "End clinic ID (e.g. 9999). Ignored if target_urls is set."
         required: false
-        default: "100"
-      write_settings_sheet:
+        default: "9999"
+      write_settings:
         description: "Write settings sheet? (true/false)"
         required: false
         default: "true"
       write_targets_sheet:
-        description: "Write targets sheet? (true/false)"
+        description: "Write 'targets' sheet? (true/false)"
         required: false
         default: "true"
 
+# 連打で前Runを潰さない
 concurrency:
   group: scrape-${{ github.ref }}
   cancel-in-progress: false
@@ -34,23 +35,34 @@ jobs:
     timeout-minutes: 360
 
     env:
+      # 既定の自動探索は 1〜END_ID（inputs が空のときに使用）
       START_ID: ${{ inputs.start_id }}
-      END_ID: ${{ inputs.end_id }}
-      TARGET_URLS: ${{ inputs.target_urls }}
-      WRITE_SETTINGS_SHEET: ${{ inputs.write_settings_sheet }}
-      WRITE_TARGETS_SHEET: ${{ inputs.write_targets_sheet }}
+      END_ID:   ${{ inputs.end_id }}
       OUTPUT_DIR: "output"
 
+      # Google Sheets（Secrets）
       GSHEET_JSON_B64: ${{ secrets.GSHEET_JSON_B64 }}
       GSHEET_KEY: ${{ secrets.GSHEET_KEY }}
+
+      # 手動URL（優先）
+      TARGET_URLS: ${{ inputs.target_urls }}
+
+      # 設定/URL記録
+      WRITE_SETTINGS_SHEET: ${{ inputs.write_settings }}
+      SETTINGS_SHEET_NAME: "settings"
+      WRITE_TARGETS_SHEET: ${{ inputs.write_targets_sheet }}
+      TARGETS_SHEET_NAME: "targets"
+
+      # 出力シート名
       CLINICS_SHEET_NAME: "clinics"
-      MENUS_SHEET_NAME: "menus"
-      HOURS_SHEET_NAME: "hours"
+      MENUS_SHEET_NAME:   "menus"
+      HOURS_SHEET_NAME:   "hours"
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
+      # 何があっても最低限のartifactを残すための準備
       - name: Prepare output folder
         run: |
           mkdir -p output
@@ -64,14 +76,39 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
-      - name: Install dependencies
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install requests beautifulsoup4 pandas google-auth gspread
 
-      - name: Run scraper (Google Sheets mode)
+      # 参考用: このRunで何をターゲットにするかをファイルに残す
+      - name: Show targets and save plan
+        shell: bash
+        run: |
+          set -e
+          mkdir -p output
+          if [ -n "${TARGET_URLS// }" ]; then
+            echo "Using TARGET_URLS input"
+            # 正規化して targets.txt に保存
+            echo "${TARGET_URLS}" | tr ',\r' '\n' | sed 's/^[ \t]*//;s/[ \t]*$//' | grep -E '^https?://' | sort -u > output/targets.txt
+          else
+            echo "Using START_ID..END_ID"
+            start=${START_ID:-1}
+            end=${END_ID:-9999}
+            : > output/targets.txt
+            for ((i=start; i<=end; i++)); do
+              printf "https://kireireport.com/clinics/%04d\n" "$i" >> output/targets.txt
+            done
+          fi
+          echo "Planned targets:"
+          head -n 20 output/targets.txt || true
+          wc -l output/targets.txt || true
+
+      - name: Run scraper
+        # スクリプト側は TARGET_URLS が空なら START_ID〜END_ID を見て自動生成する実装にしておく
         run: python scripts/scrape.py
 
+      # キャンセル/失敗でも成果物回収
       - name: Upload artifact
         if: always()
         uses: actions/upload-artifact@v4
