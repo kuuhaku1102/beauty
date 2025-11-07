@@ -1,5 +1,1 @@
-requests
-beautifulsoup4
-pandas
-gspread
-google-auth
+# ここに必要なライブラリを追記
