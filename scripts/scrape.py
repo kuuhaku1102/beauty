@@ -7,9 +7,9 @@ import pandas as pd
 
 # ---- Config ----
 USER_AGENT = "Mozilla/5.0 (compatible; ScraperBot/1.0; +https://github.com/your/repo)"
-TIMEOUT = 30
-RETRY = 3
-SLEEP_BETWEEN = 2  # polite delay
+TIMEOUT = 15           # 読み込みタイムアウト（秒）
+RETRY = 2              # リトライ回数
+SLEEP_BETWEEN = 2      # ページ間のポライトウェイト
 
 # ---- Utils ----
 def now_utc_iso():
@@ -43,38 +43,84 @@ def load_urls_from_env():
             uniq.append(u); seen.add(u)
     return uniq
 
-# ---- HTTP ----
-def fetch(url):
+# ---- HTTP (safe) ----
+def fetch_safe(url, connect_timeout=5, read_timeout=TIMEOUT, retries=RETRY):
+    """
+    ・接続/読み込みの両方にタイムアウトを設定
+    ・retries 回失敗したら "" を返して確実に復帰
+    """
     last_exc = None
-    for i in range(RETRY):
+    for i in range(retries):
         try:
-            r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT)
-            r.raise_for_status()
-            return r.text
+            r = requests.get(
+                url,
+                headers={"User-Agent": USER_AGENT},
+                timeout=(connect_timeout, read_timeout)  # (connect, read)
+            )
+            if r.status_code == 200:
+                return r.text
+            else:
+                print(f"[fetch_safe {i+1}] bad status {r.status_code} {url}")
         except Exception as e:
             last_exc = e
-            time.sleep(SLEEP_BETWEEN * (i + 1))
-    raise last_exc
+            print(f"[fetch_safe {i+1}] error {url}: {e}")
+        time.sleep(1)
+    print(f"[fetch_safe abort] {url}")
+    return ""
 
 def check_url_exists(url):
+    """
+    HEAD で軽く存在チェック → 405/403 の場合だけ GET を短時間で実施。
+    どちらもタイムアウト付きで固まらないようにする。
+    """
     try:
-        r = requests.head(url, headers={"User-Agent": USER_AGENT}, timeout=5, allow_redirects=True)
+        r = requests.head(
+            url,
+            headers={"User-Agent": USER_AGENT},
+            timeout=(3, 5),
+            allow_redirects=True
+        )
         if r.status_code in (405, 403):
-            r2 = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=10)
-            return r2.status_code == 200
+            try:
+                r2 = requests.get(
+                    url,
+                    headers={"User-Agent": USER_AGENT},
+                    timeout=(3, 7)
+                )
+                return r2.status_code == 200
+            except Exception as e:
+                print(f"[check_url_exists GET err] {url}: {e}")
+                return False
         return r.status_code == 200
-    except Exception:
+    except Exception as e:
+        print(f"[check_url_exists HEAD err] {url}: {e}")
         return False
 
-# ---- URL discovery (0001〜END_ID) ----
+# ---- URL discovery (START_ID〜END_ID) ----
 def build_target_urls_auto():
+    """
+    START_ID〜END_ID の ID で
+    https://kireireport.com/clinics/0001
+    を順に存在チェック。
+    """
     end_id_str = os.getenv("END_ID", "9999")
-    if not end_id_str.isdigit():
-        raise SystemExit("END_ID must be numeric")
+    start_id_str = os.getenv("START_ID", "1")
+
+    if not end_id_str.isdigit() or not start_id_str.isdigit():
+        raise SystemExit("START_ID / END_ID must be numeric")
+
+    start_id = int(start_id_str)
     end_id = int(end_id_str)
+    if start_id < 1:
+        start_id = 1
+    if end_id < start_id:
+        raise SystemExit(f"END_ID({end_id}) must be >= START_ID({start_id})")
+
     base_url = "https://kireireport.com/clinics"
     valid_urls = []
-    for cid in range(1, end_id + 1):
+
+    print(f"[build_target_urls_auto] scan {start_id:04d}〜{end_id:04d}")
+    for cid in range(start_id, end_id + 1):
         url = f"{base_url}/{cid:04d}"
         if check_url_exists(url):
             valid_urls.append(url)
@@ -134,11 +180,11 @@ def to_abs_url(maybe_url: str, page_url: str) -> str:
 
 def fetch_menu_image_from_detail(url):
     """メニュー詳細ページから代表画像を取得。優先: og:image → .kds-line-height-0 img → 最初の img"""
-    try:
-        html = fetch(url)
-    except Exception as e:
-        print(f"[menu_img] fetch failed: {url} ({e})")
+    html = fetch_safe(url)
+    if not html:
+        print(f"[menu_img] fetch failed: {url}")
         return ""
+
     soup = BeautifulSoup(html, "html.parser")
 
     # 1) og:image
@@ -400,6 +446,7 @@ def write_settings_sheet():
     now = now_utc_iso()
     rows = [
         {"key":"END_ID", "value": os.getenv("END_ID",""), "note":"探索の最終ID（0001〜END_ID）", "updated_utc": now},
+        {"key":"START_ID", "value": os.getenv("START_ID",""), "note":"探索の開始ID", "updated_utc": now},
         {"key":"CLINICS_SHEET_NAME", "value": CLINICS_SHEET, "note":"クリニック出力", "updated_utc": now},
         {"key":"MENUS_SHEET_NAME", "value": MENUS_SHEET, "note":"メニュー出力", "updated_utc": now},
         {"key":"HOURS_SHEET_NAME", "value": HOURS_SHEET, "note":"営業時間出力", "updated_utc": now},
@@ -446,7 +493,8 @@ def main():
     if not urls:
         raise SystemExit("No valid clinic pages found")
 
-    out_dir = os.getenv("OUTPUT_DIR", "output"); os.makedirs(out_dir, exist_ok=True)
+    out_dir = os.getenv("OUTPUT_DIR", "output")
+    os.makedirs(out_dir, exist_ok=True)
     write_targets_sheet(urls)
 
     ts = now_utc_iso()
@@ -454,8 +502,14 @@ def main():
     all_cards = []
 
     for source_page_url in urls:
+        t0 = time.time()
         print(f"[Fetch] {source_page_url}")
-        html = fetch(source_page_url)
+
+        html = fetch_safe(source_page_url)
+        if not html:
+            print(f"[Skip] empty html: {source_page_url}")
+            continue
+
         cards, soup = parse_page(html, source_page_url)
         all_cards.extend(cards)
 
@@ -474,18 +528,19 @@ def main():
             # ---- フォールバック: ページ全体から補完 ----
             need_menus = len(c.get("menus") or []) == 0
             need_hours = len(c.get("hours") or {}) == 0
-            if need_menus or need_hours:
+            if (need_menus or need_hours) and clinic_url:
                 try:
-                    detail_html = fetch(clinic_url) if clinic_url != source_page_url else html
-                    detail_soup = BeautifulSoup(detail_html, "html.parser")
-                    if need_menus:
-                        extra_menus = extract_menus_from_scope(detail_soup, base_url=clinic_url)
-                        if extra_menus:
-                            c["menus"] = extra_menus
-                    if need_hours:
-                        extra_hours = extract_hours_from_scope(detail_soup)
-                        if extra_hours:
-                            c["hours"] = extra_hours
+                    detail_html = html if clinic_url == source_page_url else fetch_safe(clinic_url)
+                    if detail_html:
+                        detail_soup = BeautifulSoup(detail_html, "html.parser")
+                        if need_menus:
+                            extra_menus = extract_menus_from_scope(detail_soup, base_url=clinic_url)
+                            if extra_menus:
+                                c["menus"] = extra_menus
+                        if need_hours:
+                            extra_hours = extract_hours_from_scope(detail_soup)
+                            if extra_hours:
+                                c["hours"] = extra_hours
                 except Exception as e:
                     print(f"[Fallback warn] detail fetch failed for {clinic_url}: {e}")
 
@@ -551,6 +606,8 @@ def main():
                     "raw": raw
                 })
 
+        elapsed = time.time() - t0
+        print(f"[Done] {source_page_url} ({elapsed:.1f}s)")
         time.sleep(SLEEP_BETWEEN)
 
     # 保存
